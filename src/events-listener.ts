@@ -63,11 +63,33 @@ export default class EventsListener {
     const filePath = file instanceof TAbstractFile ? file.path : file;
     await this.logger.info("Received delete event", filePath);
     if (file instanceof TFolder) {
-      // Skip folders
+      // When a folder is deleted, mark all tracked files inside it as deleted.
+      const folderPrefix = filePath + "/";
+      const deletedAt = Date.now();
+      let changed = false;
+      Object.keys(this.metadataStore.data.files).forEach((trackedPath) => {
+        if (
+          trackedPath.startsWith(folderPrefix) &&
+          !this.metadataStore.data.files[trackedPath].deleted
+        ) {
+          this.metadataStore.data.files[trackedPath].deleted = true;
+          this.metadataStore.data.files[trackedPath].deletedAt = deletedAt;
+          changed = true;
+        }
+      });
+      if (changed) {
+        await this.metadataStore.save();
+        await this.logger.info("Marked files in deleted folder as deleted", filePath);
+      }
       return;
     }
     if (!this.isSyncable(filePath)) {
       // The file was not in directory that we're syncing with GitHub
+      return;
+    }
+
+    if (!this.metadataStore.data.files[filePath]) {
+      // File was not tracked, nothing to update
       return;
     }
 

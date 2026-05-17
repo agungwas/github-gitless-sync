@@ -528,6 +528,24 @@ export default class SyncManager {
         switch (action.type) {
           case "upload": {
             const normalizedPath = normalizePath(action.filePath);
+            if (!(await this.vault.adapter.exists(normalizedPath))) {
+              // File was removed from disk without the delete event being tracked
+              // (e.g., a plugin folder deleted via Obsidian UI). Treat as a remote
+              // deletion instead so the file is removed from GitHub on next sync.
+              await this.logger.warn(
+                "Upload action skipped: file no longer exists, treating as delete_remote",
+                action.filePath,
+              );
+              if (this.metadataStore.data.files[action.filePath]) {
+                this.metadataStore.data.files[action.filePath].deleted = true;
+                this.metadataStore.data.files[action.filePath].deletedAt =
+                  Date.now();
+              }
+              if (newTreeFiles[action.filePath]) {
+                newTreeFiles[action.filePath].sha = null;
+              }
+              break;
+            }
             const resolution = conflictResolutions.find(
               (c: ConflictResolution) => c.filePath === action.filePath,
             );
@@ -590,7 +608,11 @@ export default class SyncManager {
   }
 
   private isVolatileSyncArtifact(filePath: string): boolean {
-    return this.isLogFile(filePath);
+    return (
+      this.isLogFile(filePath) ||
+      filePath === `${this.vault.configDir}/workspace.json` ||
+      filePath === `${this.vault.configDir}/workspace-mobile.json`
+    );
   }
 
   private filterRemoteMetadataFiles(filesMetadata: {
@@ -850,13 +872,6 @@ export default class SyncManager {
         }
 
         const localSHA = await this.calculateSHA(filePath);
-        if (remoteFile.sha === localSHA) {
-          // If the remote file sha is identical to the actual sha of the local file
-          // there are no actions to take.
-          // We calculate the SHA at the moment instead of using the one stored in the
-          // metadata file cause we update that only when the file is uploaded or downloaded.
-          return;
-        }
 
         if (remoteFile.deleted && !localFile.deleted) {
           if ((remoteFile.deletedAt as number) > localFile.lastModified) {
@@ -886,6 +901,11 @@ export default class SyncManager {
             });
             return;
           }
+        }
+        if (remoteFile.sha === localSHA) {
+          // If the remote file sha is identical to the actual sha of the local file
+          // there are no actions to take.
+          return;
         }
 
         // For non-deletion cases, use SHA as the primary source of truth.
@@ -1176,10 +1196,7 @@ export default class SyncManager {
         folders.push(...res.folders);
       }
       files.forEach((filePath: string) => {
-        if (filePath === `${this.vault.configDir}/workspace.json`) {
-          // Obsidian recommends not syncing the workspace file
-          return;
-        }
+
         if (this.isVolatileSyncArtifact(filePath)) {
           return;
         }
