@@ -403,8 +403,10 @@ export default class SyncManager {
     try {
       await this.syncImpl();
       // Shown only if sync doesn't fail
+      await this.logger.info("Sync successful");
       new Notice("Sync successful", 5000);
     } catch (err) {
+      await this.logger.error("Error syncing", { error: err instanceof Error ? err.message : String(err) });
       // Show the error to the user, it's not automatically dismissed to make sure
       // the user sees it.
       new Notice(`Error syncing. ${err}`);
@@ -819,9 +821,12 @@ export default class SyncManager {
           if (remoteContent === null) {
             return null;
           }
-          const localContent = await this.vault.adapter.read(
-            normalizePath(filePath),
-          );
+          let localContent = "";
+          if (await this.vault.adapter.exists(normalizePath(filePath))) {
+            localContent = await this.vault.adapter.read(
+              normalizePath(filePath),
+            );
+          }
           return {
             filePath,
             remoteContent,
