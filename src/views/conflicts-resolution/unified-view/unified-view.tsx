@@ -75,6 +75,7 @@ const UnifiedView = ({
           display: "flex",
           flexDirection: "column",
           overflow: "auto",
+          paddingBottom: "100px",
         }}
       >
         {files.length === 0 ? (

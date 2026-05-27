@@ -31,7 +31,13 @@ const DiffView: React.FC<DiffViewProps> = ({
   const [rightEditorTopOffset, setRightEditorTopOffset] =
     React.useState<number>(0);
 
+  const initialRemoteRef = React.useRef(remoteText);
+  const initialLocalRef = React.useRef(localText);
   const diffs = diff(remoteText, localText);
+  const resetConflicts = () => {
+    onRemoteTextChange(initialRemoteRef.current);
+    onLocalTextChange(initialLocalRef.current);
+  };
 
   return (
     <div
@@ -54,20 +60,37 @@ const DiffView: React.FC<DiffViewProps> = ({
       </div>
       <div style={{ minWidth: "160px", width: "auto" }}>
         {diffs.length === 0 && (
-          <button
-            style={{
-              position: "absolute",
-              left: "50%",
-              top: "50%",
-              transform: "translate(-50%, -50%)",
-              zIndex: 1,
-              backgroundColor: "var(--interactive-accent)",
-              color: "var(--text-on-accent)",
-            }}
-            onClick={onConflictResolved}
-          >
-            Resolve conflict
-          </button>
+          <>
+            <button
+              style={{
+                position: "absolute",
+                left: "50%",
+                top: "50%",
+                transform: "translate(-50%, -50%)",
+                zIndex: 1,
+                backgroundColor: "var(--interactive-accent)",
+                color: "var(--text-on-accent)",
+                marginRight: "var(--size-2-2)",
+              }}
+              onClick={onConflictResolved}
+            >
+              Resolve conflict
+            </button>
+            <button
+              style={{
+                position: "absolute",
+                left: "calc(50% + 120px)",
+                top: "50%",
+                transform: "translate(-50%, -50%)",
+                zIndex: 1,
+                backgroundColor: "var(--background-modifier-hover)",
+                color: "var(--text-normal)",
+              }}
+              onClick={resetConflicts}
+            >
+              Reset conflicts
+            </button>
+          </>
         )}
 
         <ActionsGutter

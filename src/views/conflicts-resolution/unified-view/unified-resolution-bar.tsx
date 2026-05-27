@@ -31,9 +31,9 @@ const UnifiedResolutionBar: React.FC<UnifiedResolutionBarProps> = ({
 
     return (
       <>
-        <ClickableText text="Accept above" onClick={() => onAcceptAbove?.()} />
+        <ClickableText text="Accept above (Remote)" onClick={() => onAcceptAbove?.()} />
         {" | "}
-        <ClickableText text="Accept below" onClick={() => onAcceptBelow?.()} />
+        <ClickableText text="Accept below (Local)" onClick={() => onAcceptBelow?.()} />
         {" | "}
         <ClickableText text="Accept both" onClick={() => onAcceptBoth?.()} />
         {" | "}

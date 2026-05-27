@@ -10,6 +10,7 @@ export const CONFLICTS_RESOLUTION_VIEW_TYPE = "conflicts-resolution-view";
 export class ConflictsResolutionView extends ItemView {
   icon: IconName = "merge";
   private root: Root | null = null;
+  private renderKey: number = 0;
 
   constructor(
     leaf: WorkspaceLeaf,
@@ -31,11 +32,17 @@ export class ConflictsResolutionView extends ItemView {
     if (this.plugin.conflictsResolver) {
       this.plugin.conflictsResolver(resolutions);
       this.plugin.conflictsResolver = null;
+      // Clear the stored conflicts so that re-opening the view doesn't
+      // replay the already-resolved conflicts as unresolved.
+      this.plugin.clearConflicts();
     }
   }
 
   setConflictFiles(conflicts: ConflictFile[]) {
     this.conflicts = conflicts;
+    // Bump the key so React fully remounts the view component,
+    // resetting its internal state (resolved files list, etc.).
+    this.renderKey++;
     this.render(conflicts);
   }
 
@@ -71,6 +78,7 @@ export class ConflictsResolutionView extends ItemView {
     if (diffMode === "split") {
       this.root.render(
         <SplitView
+          key={this.renderKey}
           initialFiles={conflicts}
           onResolveAllConflicts={this.resolveAllConflicts.bind(this)}
         />,
@@ -78,6 +86,7 @@ export class ConflictsResolutionView extends ItemView {
     } else {
       this.root.render(
         <UnifiedView
+          key={this.renderKey}
           initialFiles={conflicts}
           onResolveAllConflicts={this.resolveAllConflicts.bind(this)}
         />,

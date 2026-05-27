@@ -23,7 +23,15 @@ export const createRangesStateField = (
   initialRanges: ConflictRange[],
 ): StateField<ConflictRange[]> => {
   return StateField.define<ConflictRange[]>({
-    create: () => initialRanges,
+    create: (state) => {
+      // Filter out any ranges whose positions exceed the current document
+      // length. This guards against extensions being reconfigured after the
+      // document has been modified (shorter), which would otherwise cause
+      // lineAt() to throw with an out-of-bounds position.
+      return initialRanges.filter(
+        (r) => r.from <= state.doc.length && r.to <= state.doc.length,
+      );
+    },
     update: (ranges, tr) => {
       const rangeEffects = tr.effects
         .filter((e) => e.is(UpdateRangesEffect))
@@ -63,8 +71,10 @@ export const createRangesStateField = (
 
       // First pass: determine which range controls each line
       for (const range of newRanges) {
-        const startLine = tr.newDoc.lineAt(range.from).number;
-        const endLine = tr.newDoc.lineAt(range.to).number;
+        const fromPos = Math.min(range.from, tr.newDoc.length);
+        const toPos = Math.min(range.to, tr.newDoc.length);
+        const startLine = tr.newDoc.lineAt(fromPos).number;
+        const endLine = tr.newDoc.lineAt(toPos).number;
 
         for (let line = startLine; line <= endLine; line++) {
           // If this line isn't claimed yet, the leftmost range (processed first) gets it

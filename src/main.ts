@@ -258,6 +258,10 @@ export default class GitHubSyncPlugin extends Plugin {
     this.conflictsRibbonIcon = null;
   }
 
+  clearConflicts() {
+    this.conflicts = [];
+  }
+
   async openConflictsView() {
     await this.activateView();
     this.getConflictsView()?.setConflictFiles(this.conflicts);

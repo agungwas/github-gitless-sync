@@ -74,6 +74,12 @@ export const createLineDecorations = (
     const builder = new RangeSetBuilder<Decoration>();
 
     for (const range of ranges) {
+      // Guard: skip ranges whose positions exceed the current document length.
+      // This can happen if extensions are reconfigured after the document has
+      // been modified, producing stale positions from a longer document.
+      if (range.from > state.doc.length || range.to > state.doc.length) {
+        continue;
+      }
       const startLine = state.doc.lineAt(range.from);
       const endLine = state.doc.lineAt(range.to);
       for (let i = 0; i <= endLine.number - startLine.number; i += 1) {

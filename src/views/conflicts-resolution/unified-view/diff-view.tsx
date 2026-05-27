@@ -118,36 +118,52 @@ const DiffView: React.FC<DiffViewProps> = ({
 }) => {
   const editorViewRef = React.useRef<EditorView | null>(null);
 
-  const diffChunks = diff(initialRemoteText, initialLocalText);
-  const { doc, lineRanges } = createUnifiedDocument(
-    initialRemoteText,
-    initialLocalText,
-    diffChunks,
-  );
+  // Memoize so these are stable references across re-renders.
+  // Without this, lineRanges would be a new array on every render (e.g. when
+  // setHasConflicts fires), causing the extensions useMemo below to recompute
+  // and recreate the rangesStateField with original values — resetting all
+  // conflict resolution progress and blanking the editor.
+  const { diffChunks, doc, lineRanges } = React.useMemo(() => {
+    const chunks = diff(initialRemoteText, initialLocalText);
+    const unified = createUnifiedDocument(initialRemoteText, initialLocalText, chunks);
+    return { diffChunks: chunks, doc: unified.doc, lineRanges: unified.lineRanges };
+  }, [initialRemoteText, initialLocalText]);
 
   const [hasConflicts, setHasConflicts] = React.useState(diffChunks.length > 0);
+  const [resetKey, setResetKey] = React.useState(0);
 
-  const extensions = React.useMemo(() => {
+  const resetConflicts = () => {
+    setResetKey((prev) => prev + 1);
+    setHasConflicts(diffChunks.length > 0);
+  };
+
+  // Use a ref instead of useMemo to guarantee extensions stability.
+  // React's useMemo is a performance hint, not a semantic guarantee — it may
+  // discard and recompute the value even when deps haven't changed. If that
+  // happens mid-session, react-codemirror calls view.reconfigure(), which
+  // re-initialises the StateField with the original lineRanges (positions
+  // based on the full original document) while the current doc is already
+  // shorter due to user resolution actions. The decoration compute then calls
+  // lineAt() with an out-of-bounds position and throws RangeError.
+  // The component is keyed on resetKey, so a reset triggers a full remount
+  // and this ref is naturally re-initialised to null.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const extensionsRef = React.useRef<any[] | null>(null);
+  if (extensionsRef.current === null) {
     const conflictRangesField = createRangesStateField(lineRanges);
-    return [
+    extensionsRef.current = [
       conflictRangesField,
       createLineDecorations(conflictRangesField),
       createResolutionDecorations(
         conflictRangesField,
-
         () => editorViewRef.current!,
       ),
       EditorView.updateListener.of((update) => {
-        if (update.docChanged) {
-          const conflictRanges = update.state.field(conflictRangesField);
-          const allConflictsSolved = conflictRanges.some(
-            (range) => range.source === "remote" || range.source === "local",
-          );
-
-          if (!allConflictsSolved) {
-            setHasConflicts(allConflictsSolved);
-          }
-        }
+        const conflictRanges = update.state.field(conflictRangesField);
+        const hasUnsolved = conflictRanges.some(
+          (range) => range.source === "remote" || range.source === "local",
+        );
+        setHasConflicts(hasUnsolved);
       }),
       EditorView.editable.of(true),
       EditorView.theme({
@@ -180,21 +196,20 @@ const DiffView: React.FC<DiffViewProps> = ({
         },
       }),
     ];
-  }, [initialRemoteText, initialLocalText]);
+  }
+  const extensions = extensionsRef.current;
 
   return (
     <div
       style={{
         width: "100%",
-        height: "100%",
         display: "flex",
         flexDirection: "column",
-        overflow: "hidden",
       }}
     >
       <CodeMirror
+        key={resetKey}
         value={doc}
-        height="100%"
         theme="none"
         basicSetup={false}
         extensions={extensions}
@@ -206,9 +221,11 @@ const DiffView: React.FC<DiffViewProps> = ({
         style={{
           display: "flex",
           justifyContent: "center",
+          gap: "var(--size-4-4)",
           paddingTop: "var(--size-4-4)",
         }}
       >
+        <button onClick={resetConflicts}>Reset conflicts</button>
         <button
           style={
             hasConflicts
