@@ -51,13 +51,13 @@ const EditorPane: React.FC<EditorPaneProps> = (props) => {
           borderLeftColor: "var(--text-normal)",
         },
         ".diff-modify-background": {
-          backgroundColor: "rgba(var(--color-yellow-rgb), 0.1)",
+          backgroundColor: "rgba(var(--color-yellow-rgb, 255, 197, 51), 0.15)",
         },
         ".diff-add-background": {
-          backgroundColor: "rgba(var(--color-green-rgb), 0.1)",
+          backgroundColor: "rgba(var(--color-green-rgb, 71, 167, 71), 0.15)",
         },
         ".diff-remove-background": {
-          backgroundColor: "rgba(var(--color-red-rgb), 0.1)",
+          backgroundColor: "rgba(var(--color-red-rgb, 251, 70, 76), 0.15)",
         },
       }),
       markdown(),

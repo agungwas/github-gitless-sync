@@ -189,10 +189,10 @@ const DiffView: React.FC<DiffViewProps> = ({
           borderLeftColor: "var(--text-normal)",
         },
         ".cm-addedLine": {
-          backgroundColor: "rgba(var(--color-green-rgb), 0.1)",
+          backgroundColor: "rgba(var(--color-green-rgb, 71, 167, 71), 0.15)",
         },
         ".cm-deletedLine": {
-          backgroundColor: "rgba(var(--color-red-rgb), 0.1)",
+          backgroundColor: "rgba(var(--color-red-rgb, 251, 70, 76), 0.15)",
         },
       }),
     ];
