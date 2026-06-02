@@ -14,6 +14,7 @@ export interface GitHubSyncSettings {
   showSyncRibbonButton: boolean;
   showConflictsRibbonButton: boolean;
   enableLogging: boolean;
+  commitMessageTemplate: string;
 }
 
 export const DEFAULT_SETTINGS: GitHubSyncSettings = {
@@ -32,4 +33,5 @@ export const DEFAULT_SETTINGS: GitHubSyncSettings = {
   showSyncRibbonButton: true,
   showConflictsRibbonButton: true,
   enableLogging: false,
+  commitMessageTemplate: "Sync from {deviceName} at {YYYY-MM-DD HH:mm}",
 };

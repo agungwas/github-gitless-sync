@@ -4,6 +4,7 @@ import {
   normalizePath,
   base64ToArrayBuffer,
   arrayBufferToBase64,
+  moment,
 } from "obsidian";
 import GithubClient, {
   GetTreeResponseItem,
@@ -41,6 +42,8 @@ export interface ConflictResolution {
 type OnConflictsCallback = (
   conflicts: ConflictFile[],
 ) => Promise<ConflictResolution[]>;
+
+export const DEVICE_NAME_STORAGE_KEY = "github-gitless-sync-device-name" as const;
 
 export default class SyncManager {
   private metadataStore: MetadataStore;
@@ -417,6 +420,7 @@ export default class SyncManager {
 
   private async syncImpl() {
     await this.logger.info("Starting sync");
+    await this.reconcileConfigDirFiles();
     const { files, sha: treeSha } = await this.client.getRepoContent({
       retry: true,
     });
@@ -646,6 +650,62 @@ export default class SyncManager {
       }
     });
     if (changed) {
+      await this.metadataStore.save();
+    }
+  }
+
+  /**
+   * Scans vault.configDir and adds any untracked files to local metadata.
+   * Also resets files marked deleted that have since reappeared on disk (e.g. reinstalled plugin/theme).
+   * No-op when syncConfigDir is disabled.
+   */
+  private async reconcileConfigDirFiles(): Promise<void> {
+    if (!this.settings.syncConfigDir) {
+      return;
+    }
+
+    let configFiles: string[] = [];
+    let folders = [this.vault.configDir];
+    while (folders.length > 0) {
+      const folder = folders.pop();
+      if (!folder) continue;
+      const res = await this.vault.adapter.list(folder);
+      configFiles.push(...res.files);
+      folders.push(...res.folders);
+    }
+
+    let changed = false;
+    for (const filePath of configFiles) {
+      if (this.isVolatileSyncArtifact(filePath)) continue;
+      if (filePath.split("/").last()?.startsWith(".")) continue;
+
+      const existing = this.metadataStore.data.files[filePath];
+      if (!existing) {
+        // Case A: new file, not yet tracked
+        this.metadataStore.data.files[filePath] = {
+          path: filePath,
+          sha: null,
+          dirty: false,
+          justDownloaded: false,
+          lastModified: Date.now(),
+        };
+        changed = true;
+      } else if (existing.deleted === true) {
+        // Case B: file marked deleted but exists on disk — likely reinstalled
+        const stat = await this.vault.adapter.stat(filePath);
+        if (stat === null) continue;
+        if (stat.mtime <= (existing.deletedAt as number)) continue;
+        // File appeared after deletion timestamp → reinstalled
+        existing.deleted = false;
+        existing.deletedAt = null;
+        existing.sha = null;
+        existing.lastModified = stat.mtime;
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      await this.logger.info("Reconciled config dir files into metadata");
       await this.metadataStore.save();
     }
   }
@@ -1002,6 +1062,16 @@ export default class SyncManager {
     );
   }
 
+  private static buildCommitMessage(template: string, deviceName: string): string {
+    return template.replace(/\{([^}]+)\}/g, (match, token: string) => {
+      if (token === "deviceName") return deviceName;
+      const formatted = moment().format(token);
+      // moment returns the token string itself when given an invalid format;
+      // preserve original {token} to signal misconfiguration rather than silently drop it
+      return formatted === token ? match : formatted;
+    });
+  }
+
   /**
    * Creates a new sync commit in the remote repository.
    *
@@ -1115,9 +1185,14 @@ export default class SyncManager {
 
     const branchHeadSha = await this.client.getBranchHeadSha({ retry: true });
 
+    const deviceName = window.localStorage.getItem(DEVICE_NAME_STORAGE_KEY)?.trim() ?? "";
+    const message = SyncManager.buildCommitMessage(
+      this.settings.commitMessageTemplate,
+      deviceName,
+    );
+
     const commitSha = await this.client.createCommit({
-      // TODO: Make this configurable or find a nicer commit message
-      message: "Sync",
+      message,
       treeSha: newTreeSha,
       parent: branchHeadSha,
     });
@@ -1228,47 +1303,7 @@ export default class SyncManager {
       };
       this.metadataStore.save();
     } else if (this.settings.syncConfigDir) {
-      // Metadata already exists but may be missing config dir files.
-      // This happens when the user enables syncConfigDir after the initial
-      // metadata was created. We reconcile by ensuring all config dir files
-      // are registered without overwriting existing entries that already
-      // have a known SHA.
-      await this.logger.info("Reconciling config dir files into metadata");
-      let configFiles: string[] = [];
-      let folders = [this.vault.configDir];
-      while (folders.length > 0) {
-        const folder = folders.pop();
-        if (folder === undefined) {
-          continue;
-        }
-        const res = await this.vault.adapter.list(folder);
-        configFiles.push(...res.files);
-        folders.push(...res.folders);
-      }
-      let changed = false;
-      configFiles.forEach((filePath: string) => {
-        if (filePath === `${this.vault.configDir}/workspace.json`) {
-          return;
-        }
-        if (this.isVolatileSyncArtifact(filePath)) {
-          return;
-        }
-        // Only add if not already tracked — preserve existing SHA info
-        if (!this.metadataStore.data.files[filePath]) {
-          this.metadataStore.data.files[filePath] = {
-            path: filePath,
-            sha: null,
-            dirty: false,
-            justDownloaded: false,
-            lastModified: Date.now(),
-          };
-          changed = true;
-        }
-      });
-      if (changed) {
-        await this.logger.info("Added missing config dir files to metadata");
-        this.metadataStore.save();
-      }
+      await this.reconcileConfigDirFiles();
     }
     await this.removeVolatileArtifactsFromLocalMetadata();
     await this.logger.info("Loaded metadata");

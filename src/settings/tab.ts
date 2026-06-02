@@ -8,6 +8,7 @@ import {
 } from "obsidian";
 import GitHubSyncPlugin from "src/main";
 import { copyToClipboard } from "src/utils";
+import { DEVICE_NAME_STORAGE_KEY } from "src/sync-manager";
 
 export default class GitHubSyncSettingsTab extends PluginSettingTab {
   plugin: GitHubSyncPlugin;
@@ -167,6 +168,38 @@ export default class GitHubSyncSettingsTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           });
       });
+
+    new Setting(containerEl)
+      .setName("Device name")
+      .setDesc(
+        "Name of this device used in commit messages. Stored locally only — never synced to GitHub.",
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder("e.g. MacBook, iPad, Work PC")
+          .setValue(window.localStorage.getItem(DEVICE_NAME_STORAGE_KEY) ?? "")
+          .onChange((value) => {
+            window.localStorage.setItem(DEVICE_NAME_STORAGE_KEY, value.trim());
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("Commit message template")
+      .setDesc(
+        "Template for GitHub commit messages. " +
+          "Use {deviceName} for this device's name. " +
+          "Use any moment.js format token in braces for date/time, e.g. {YYYY-MM-DD HH:mm}.",
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder("Sync from {deviceName} at {YYYY-MM-DD HH:mm}")
+          .setValue(this.plugin.settings.commitMessageTemplate)
+          .onChange(async (value) => {
+            this.plugin.settings.commitMessageTemplate =
+              value || "Sync from {deviceName} at {YYYY-MM-DD HH:mm}";
+            await this.plugin.saveSettings();
+          }),
+      );
 
     const conflictHandlingOptions = {
       overwriteLocal: "Overwrite local file",
