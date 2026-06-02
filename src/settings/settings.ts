@@ -14,7 +14,6 @@ export interface GitHubSyncSettings {
   showSyncRibbonButton: boolean;
   showConflictsRibbonButton: boolean;
   enableLogging: boolean;
-  commitMessageTemplate: string;
 }
 
 export const DEFAULT_SETTINGS: GitHubSyncSettings = {
@@ -33,5 +32,15 @@ export const DEFAULT_SETTINGS: GitHubSyncSettings = {
   showSyncRibbonButton: true,
   showConflictsRibbonButton: true,
   enableLogging: false,
-  commitMessageTemplate: "Sync at {YYYY-MM-DD HH:mm}",
 };
+
+const COMMIT_TEMPLATE_KEY = "gitless-commit-message-template";
+const COMMIT_TEMPLATE_DEFAULT = "Sync at {YYYY-MM-DD HH:mm}";
+
+export function getCommitMessageTemplate(): string {
+  return localStorage.getItem(COMMIT_TEMPLATE_KEY) ?? COMMIT_TEMPLATE_DEFAULT;
+}
+
+export function setCommitMessageTemplate(value: string): void {
+  localStorage.setItem(COMMIT_TEMPLATE_KEY, value || COMMIT_TEMPLATE_DEFAULT);
+}

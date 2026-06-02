@@ -8,6 +8,7 @@ import {
 } from "obsidian";
 import GitHubSyncPlugin from "src/main";
 import { copyToClipboard } from "src/utils";
+import { getCommitMessageTemplate, setCommitMessageTemplate } from "src/settings/settings";
 
 export default class GitHubSyncSettingsTab extends PluginSettingTab {
   plugin: GitHubSyncPlugin;
@@ -177,11 +178,9 @@ export default class GitHubSyncSettingsTab extends PluginSettingTab {
       .addText((text) =>
         text
           .setPlaceholder("Sync at {YYYY-MM-DD HH:mm}")
-          .setValue(this.plugin.settings.commitMessageTemplate)
-          .onChange(async (value) => {
-            this.plugin.settings.commitMessageTemplate =
-              value || "Sync at {YYYY-MM-DD HH:mm}";
-            await this.plugin.saveSettings();
+          .setValue(getCommitMessageTemplate())
+          .onChange((value) => {
+            setCommitMessageTemplate(value);
           }),
       );
 

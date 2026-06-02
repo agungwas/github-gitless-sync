@@ -17,7 +17,7 @@ import MetadataStore, {
   MANIFEST_FILE_NAME,
 } from "./metadata-store";
 import EventsListener from "./events-listener";
-import { GitHubSyncSettings } from "./settings/settings";
+import { GitHubSyncSettings, getCommitMessageTemplate } from "./settings/settings";
 import Logger, { LOG_FILE_NAME } from "./logger";
 import { decodeBase64String, hasTextExtension } from "./utils";
 import GitHubSyncPlugin from "./main";
@@ -1181,7 +1181,7 @@ export default class SyncManager {
 
     const branchHeadSha = await this.client.getBranchHeadSha({ retry: true });
 
-    const message = SyncManager.buildCommitMessage(this.settings.commitMessageTemplate);
+    const message = SyncManager.buildCommitMessage(getCommitMessageTemplate());
 
     const commitSha = await this.client.createCommit({
       message,
