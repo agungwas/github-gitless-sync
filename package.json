@@ -1,5 +1,5 @@
 {
-  "name": "github-gitless-sync",
+  "name": "gitless",
   "version": "1.0.7",
   "description": "Sync a GitHub repository with vaults on different platforms without requiring git installation",
   "main": "main.js",

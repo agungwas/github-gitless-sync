@@ -43,7 +43,6 @@ type OnConflictsCallback = (
   conflicts: ConflictFile[],
 ) => Promise<ConflictResolution[]>;
 
-export const DEVICE_NAME_STORAGE_KEY = "github-gitless-sync-device-name" as const;
 
 export default class SyncManager {
   private metadataStore: MetadataStore;
@@ -1062,12 +1061,9 @@ export default class SyncManager {
     );
   }
 
-  private static buildCommitMessage(template: string, deviceName: string): string {
+  private static buildCommitMessage(template: string): string {
     return template.replace(/\{([^}]+)\}/g, (match, token: string) => {
-      if (token === "deviceName") return deviceName;
       const formatted = moment().format(token);
-      // moment returns the token string itself when given an invalid format;
-      // preserve original {token} to signal misconfiguration rather than silently drop it
       return formatted === token ? match : formatted;
     });
   }
@@ -1185,11 +1181,7 @@ export default class SyncManager {
 
     const branchHeadSha = await this.client.getBranchHeadSha({ retry: true });
 
-    const deviceName = window.localStorage.getItem(DEVICE_NAME_STORAGE_KEY)?.trim() ?? "";
-    const message = SyncManager.buildCommitMessage(
-      this.settings.commitMessageTemplate,
-      deviceName,
-    );
+    const message = SyncManager.buildCommitMessage(this.settings.commitMessageTemplate);
 
     const commitSha = await this.client.createCommit({
       message,

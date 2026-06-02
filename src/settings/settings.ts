@@ -33,5 +33,5 @@ export const DEFAULT_SETTINGS: GitHubSyncSettings = {
   showSyncRibbonButton: true,
   showConflictsRibbonButton: true,
   enableLogging: false,
-  commitMessageTemplate: "Sync from {deviceName} at {YYYY-MM-DD HH:mm}",
+  commitMessageTemplate: "Sync at {YYYY-MM-DD HH:mm}",
 };
