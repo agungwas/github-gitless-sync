@@ -14,6 +14,8 @@ export interface GitHubSyncSettings {
   showSyncRibbonButton: boolean;
   showConflictsRibbonButton: boolean;
   enableLogging: boolean;
+  syncOnWindowFocus: boolean;
+  syncOnWindowBlur: boolean;
 }
 
 export const DEFAULT_SETTINGS: GitHubSyncSettings = {
@@ -32,6 +34,8 @@ export const DEFAULT_SETTINGS: GitHubSyncSettings = {
   showSyncRibbonButton: true,
   showConflictsRibbonButton: true,
   enableLogging: false,
+  syncOnWindowFocus: false,
+  syncOnWindowBlur: false,
 };
 
 const COMMIT_TEMPLATE_KEY = "gitless-commit-message-template";

@@ -153,6 +153,30 @@ export default class GitHubSyncSettingsTab extends PluginSettingTab {
       });
 
     new Setting(containerEl)
+      .setName("Sync on window focus")
+      .setDesc("Automatically sync when Obsidian gains focus")
+      .addToggle((toggle) => {
+        toggle
+          .setValue(this.plugin.settings.syncOnWindowFocus)
+          .onChange(async (value) => {
+            this.plugin.settings.syncOnWindowFocus = value;
+            await this.plugin.saveSettings();
+          });
+      });
+
+    new Setting(containerEl)
+      .setName("Sync on window blur")
+      .setDesc("Automatically sync when Obsidian loses focus (e.g. switching apps)")
+      .addToggle((toggle) => {
+        toggle
+          .setValue(this.plugin.settings.syncOnWindowBlur)
+          .onChange(async (value) => {
+            this.plugin.settings.syncOnWindowBlur = value;
+            await this.plugin.saveSettings();
+          });
+      });
+
+    new Setting(containerEl)
       .setName("Sync configs")
       .setDesc("Sync Vault config folder with remote repository")
       .addToggle((toggle) => {
@@ -169,10 +193,12 @@ export default class GitHubSyncSettingsTab extends PluginSettingTab {
           });
       });
 
+    new Setting(containerEl).setName("Device Specific").setHeading();
+
     new Setting(containerEl)
       .setName("Commit message template")
       .setDesc(
-        "Template for GitHub commit messages. " +
+        "Template for GitHub commit messages. This is stored on the device and will not be synced to other devices. " +
           "Use any moment.js format token in braces for date/time, e.g. {YYYY-MM-DD HH:mm}.",
       )
       .addText((text) =>

@@ -139,6 +139,26 @@ export default class GitHubSyncPlugin extends Plugin {
       icon: "refresh-cw",
       callback: this.openConflictsView.bind(this),
     });
+
+    this.registerDomEvent(window, "focus", () => {
+      if (this.settings.syncOnWindowFocus) {
+        this.sync();
+      }
+    });
+
+    this.registerDomEvent(window, "blur", () => {
+      if (this.settings.syncOnWindowBlur) {
+        this.sync();
+      }
+    });
+
+    this.registerDomEvent(document, "visibilitychange", () => {
+      if (document.visibilityState === "visible" && this.settings.syncOnWindowFocus) {
+        this.sync();
+      } else if (document.visibilityState === "hidden" && this.settings.syncOnWindowBlur) {
+        this.sync();
+      }
+    });
   }
 
   async sync() {

@@ -104,6 +104,22 @@ export const createLineDecorations = (
   });
 };
 
+function dispatchPreservingScroll(
+  view: EditorView,
+  tr: Parameters<EditorView["dispatch"]>[0],
+) {
+  const outerScroller = view.dom.closest(
+    ".gitless-conflict-scroll",
+  ) as HTMLElement | null;
+  const savedTop = outerScroller?.scrollTop ?? 0;
+  view.dispatch(tr);
+  if (outerScroller) {
+    requestAnimationFrame(() => {
+      outerScroller.scrollTop = savedTop;
+    });
+  }
+}
+
 /// Create the resolution buttons depending on the ranges state field.
 /// We need the view to dispatch the transaction to update the document
 /// and delete the ranges when the user click the buttons.
@@ -130,7 +146,7 @@ export const createResolutionDecorations = (
             const deco = Decoration.widget({
               widget: new ResolutionWidget({
                 onAcceptAbove: () => {
-                  getView().dispatch({
+                  dispatchPreservingScroll(getView(), {
                     changes: {
                       from: range.to,
                       to: nextRange.to,
@@ -148,7 +164,7 @@ export const createResolutionDecorations = (
                   });
                 },
                 onAcceptBelow: () => {
-                  getView().dispatch({
+                  dispatchPreservingScroll(getView(), {
                     changes: {
                       from: range.from,
                       to: nextRange?.from || range.to,
@@ -166,7 +182,7 @@ export const createResolutionDecorations = (
                   });
                 },
                 onAcceptBoth: () => {
-                  getView().dispatch({
+                  dispatchPreservingScroll(getView(), {
                     effects: [
                       UpdateRangesEffect.of({
                         index,
@@ -180,7 +196,7 @@ export const createResolutionDecorations = (
                   });
                 },
                 onDiscardBoth: () => {
-                  getView().dispatch({
+                  dispatchPreservingScroll(getView(), {
                     changes: {
                       from: Math.max(range.from - 1, 0),
                       to: ranges.at(index + 2)?.from || nextRange.to,
@@ -205,7 +221,7 @@ export const createResolutionDecorations = (
             const deco = Decoration.widget({
               widget: new ResolutionWidget({
                 onAccept: () => {
-                  getView().dispatch({
+                  dispatchPreservingScroll(getView(), {
                     effects: UpdateRangesEffect.of({
                       index: index,
                       newSource: "both",
@@ -213,7 +229,7 @@ export const createResolutionDecorations = (
                   });
                 },
                 onDiscard: () => {
-                  getView().dispatch({
+                  dispatchPreservingScroll(getView(), {
                     changes: {
                       from: Math.max(range.from - 1, 0),
                       to: nextRange?.from || range.to,
@@ -239,7 +255,7 @@ export const createResolutionDecorations = (
           const deco = Decoration.widget({
             widget: new ResolutionWidget({
               onAccept: () => {
-                getView().dispatch({
+                dispatchPreservingScroll(getView(), {
                   effects: UpdateRangesEffect.of({
                     index: index,
                     newSource: "both",
@@ -247,7 +263,7 @@ export const createResolutionDecorations = (
                 });
               },
               onDiscard: () => {
-                getView().dispatch({
+                dispatchPreservingScroll(getView(), {
                   changes: {
                     from: Math.max(range.from - 1, 0),
                     to: nextRange?.from || range.to,

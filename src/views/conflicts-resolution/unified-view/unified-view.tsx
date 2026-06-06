@@ -70,6 +70,7 @@ const UnifiedView = ({
   return (
     <React.StrictMode>
       <div
+        className="gitless-conflict-scroll"
         style={{
           height: "100%",
           display: "flex",

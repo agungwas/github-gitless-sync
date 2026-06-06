@@ -220,11 +220,18 @@ const DiffView: React.FC<DiffViewProps> = ({
       <div
         style={{
           display: "flex",
+          flexWrap: "wrap",
           justifyContent: "center",
           gap: "var(--size-4-4)",
           paddingTop: "var(--size-4-4)",
         }}
       >
+        <button onClick={() => onConflictResolved(initialRemoteText)}>
+          Accept all remote
+        </button>
+        <button onClick={() => onConflictResolved(initialLocalText)}>
+          Accept all local
+        </button>
         <button onClick={resetConflicts}>Reset conflicts</button>
         <button
           style={
