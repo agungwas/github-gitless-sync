@@ -35,7 +35,9 @@ export const base64ToArrayBuffer = (s: string) => {
 };
 
 export const Notice = vi.fn();
+export const normalizePath = (path: string) => path;
 export class Plugin {}
 export class ItemView {}
 export const Platform = { isMobile: false };
 export class WorkspaceLeaf {}
+export class PluginSettingTab {}

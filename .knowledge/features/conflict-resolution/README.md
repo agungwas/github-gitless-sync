@@ -1,7 +1,10 @@
+---
+last_updated: "2026-06-12"
+updated_by_plan: "plan-conflict-open-new-tab.md"
+decision: "Open conflict view in a new tab by default"
+---
 # Conflict Resolution View
 
-Last updated: 2026-06-06
-Updated by plan: PLAN_conflict-and-settings.md
 
 ## Overview
 
@@ -28,7 +31,8 @@ The Conflict Resolution View provides a UI for resolving git merge conflicts. It
 1. **Triggering**:
    - `SyncManager.syncImpl()` detects conflicts (`findConflicts()`).
    - It pauses sync by `await this.onConflicts(conflicts)`.
-   - `GitHubSyncPlugin` opens `ConflictsResolutionView` and stores a `conflictsResolver` promise.
+   - `GitHubSyncPlugin.activateView()` checks if `CONFLICTS_RESOLUTION_VIEW_TYPE` is open. If already open, it reuses the tab. If not, it checks if the active tab is an empty "New Tab" page. If it is empty, it replaces it; otherwise, it opens the conflict view in a new tab.
+   - It stores a `conflictsResolver` promise and opens the view.
 
 2. **Mobile Context (Unified View)**:
    - Evaluated in `view.tsx`: `if (Platform.isMobile) diffMode = "unified"`.
