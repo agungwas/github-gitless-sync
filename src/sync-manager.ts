@@ -93,6 +93,7 @@ export default class SyncManager {
   async firstSync() {
     if (this.syncing) {
       this.logger.info("First sync already in progress");
+      new Notice("First sync already in progress");
       // We're already syncing, nothing to do
       return;
     }
@@ -396,6 +397,7 @@ export default class SyncManager {
   async sync() {
     if (this.syncing) {
       this.logger.info("Sync already in progress");
+      new Notice("Sync already in progress");
       // We're already syncing, nothing to do
       return;
     }
@@ -476,9 +478,9 @@ export default class SyncManager {
 
         // It's not necessary to set conflict resolutions as the content the
         // user expect must be the content of the remote file with no changes.
-        conflictActions = conflictResolutions.map(
-          (resolution: ConflictResolution) => {
-            return { type: "download", filePath: resolution.filePath };
+        conflictActions = conflicts.map(
+          (conflict: ConflictFile) => {
+            return { type: "download", filePath: conflict.filePath };
           },
         );
       } else if (this.settings.conflictHandling === "overwriteRemote") {
@@ -487,9 +489,9 @@ export default class SyncManager {
 
         // It's not necessary to set conflict resolutions as the content the
         // user expect must be the content of the local file with no changes.
-        conflictActions = conflictResolutions.map(
-          (resolution: ConflictResolution) => {
-            return { type: "upload", filePath: resolution.filePath };
+        conflictActions = conflicts.map(
+          (conflict: ConflictFile) => {
+            return { type: "upload", filePath: conflict.filePath };
           },
         );
       }
@@ -1061,6 +1063,17 @@ export default class SyncManager {
     );
   }
 
+  async calculateSHAFromString(content: string): Promise<string> {
+    const contentBytes = new TextEncoder().encode(content);
+    const header = new TextEncoder().encode(`blob ${contentBytes.length}\0`);
+    const store = new Uint8Array([...header, ...contentBytes]);
+    return await crypto.subtle.digest("SHA-1", store).then((hash) =>
+      Array.from(new Uint8Array(hash))
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join(""),
+    );
+  }
+
   private static buildCommitMessage(template: string): string {
     return template.replace(/\{([^}]+)\}/g, (match, token: string) => {
       const formatted = moment().format(token);
@@ -1117,7 +1130,7 @@ export default class SyncManager {
           // to determine the file type, though I feel it's ok to compromise and rely
           // on them if it makes the plugin handle upload better on certain devices.
           if (hasTextExtension(filePath)) {
-            const sha = await this.calculateSHA(filePath);
+            const sha = await this.calculateSHAFromString(treeFiles[filePath].content as string);
             if (this.metadataStore.data.files[filePath]) {
               this.metadataStore.data.files[filePath].sha = sha;
             } else {

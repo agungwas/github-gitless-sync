@@ -1,3 +1,11 @@
+---
+iris_schema: 4
+plan_retention_days: 4
+updated: "2026-06-12"
+# composite_max_parents: 2
+# parallel:
+#   plan_worktree_root: .worktrees/plans
+---
 # Project Overview
 
 ## Testing Stack & Patterns

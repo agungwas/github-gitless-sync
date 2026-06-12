@@ -1,6 +1,9 @@
+---
+status: "done"
+completed: "2026-06-06"
+---
 # Conflict Resolution Layout & Commit Message Config
 
-Status: done
 
 ## Business Rules
 - On narrow screens, the conflict resolution action buttons should wrap to avoid horizontal overflow.

@@ -41,3 +41,4 @@ export class ItemView {}
 export const Platform = { isMobile: false };
 export class WorkspaceLeaf {}
 export class PluginSettingTab {}
+export class TextFileView {}

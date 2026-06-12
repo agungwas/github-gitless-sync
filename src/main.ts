@@ -4,6 +4,7 @@ import {
   WorkspaceLeaf,
   normalizePath,
   Notice,
+  TextFileView,
 } from "obsidian";
 import { GitHubSyncSettings, DEFAULT_SETTINGS } from "./settings/settings";
 import GitHubSyncSettingsTab from "./settings/tab";
@@ -164,6 +165,16 @@ export default class GitHubSyncPlugin extends Plugin {
   }
 
   async sync() {
+    // Force all open text editors to flush their in-memory changes to disk
+    // This is critical on mobile where file writes are delayed, otherwise we upload stale data
+    const savePromises: Promise<void>[] = [];
+    this.app.workspace.iterateAllLeaves((leaf) => {
+      if (leaf.view instanceof TextFileView) {
+        savePromises.push(leaf.view.save());
+      }
+    });
+    await Promise.all(savePromises);
+
     if (
       this.settings.githubToken === "" ||
       this.settings.githubOwner === "" ||

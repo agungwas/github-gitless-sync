@@ -1,3 +1,5 @@
+---
+---
 # Impact Analysis: Config Dir Mid-Session Plugin Install Not Synced
 
 ## Goal (change description)

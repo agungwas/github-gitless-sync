@@ -12,3 +12,8 @@ updated: "2026-06-12"
 **Chose:** Open conflict view in a new tab (or reuse empty tab) instead of indiscriminately replacing the active tab for `conflict-resolution`.
 **Why:** Replacing the active tab is highly disruptive to the user's workflow when a sync triggers in the background. Opening a new tab leverages native Obsidian behavior while preserving context.
 **Plan:** ./features/conflict-resolution/plans/plan-conflict-open-new-tab.md
+
+## 2026-06-12 — Force Save Before Sync
+**Chose:** Await `TextFileView.save()` on all open editors before sync for `sync`. **Over:** Locking the screen during sync, doing nothing.
+**Why:** Safely flushes mobile memory to disk before `adapter.read()` without interrupting user typing flow.
+**Plan:** ./features/sync/plans/plan-force-save-before-sync.md

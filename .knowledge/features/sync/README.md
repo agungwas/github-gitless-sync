@@ -1,7 +1,10 @@
+---
+last_updated: "2026-06-12"
+updated_by_plan: "plan-force-save-before-sync.md"
+decision: "2026-06-12 — Force Save Before Sync"
+---
 # Sync Feature
 
-Last updated: 2026-06-06
-Updated by plan: PLAN_conflict-and-settings.md
 
 ## Files
 
@@ -38,6 +41,8 @@ interface FileMetadata {
 Metadata is written via a serial write queue (`MetadataStore.writeQueue`) to prevent concurrent writes.
 
 ## Sync Flows
+
+All sync flows are initiated via the plugin's `sync()` entrypoint, which first forces all open text editors to flush their in-memory changes to disk (by awaiting `save()` on all open `TextFileView` instances) to prevent uploading stale data (critical on mobile).
 
 ### First Sync (`firstSync()` → `firstSyncImpl()`)
 
@@ -188,7 +193,7 @@ Registered after `onLayoutReady` to avoid create-event spam on startup.
 
 ## Concurrency
 
-`this.syncing: boolean` flag in `SyncManager`. Both `firstSync()` and `sync()` check and set it — prevents concurrent syncs. Not a lock; race possible if two sync triggers fire in the same JS tick (unlikely in practice).
+`this.syncing: boolean` flag in `SyncManager`. Both `firstSync()` and `sync()` check and set it — prevents concurrent syncs. Not a lock; race possible if two sync triggers fire in the same JS tick (unlikely in practice). If triggered while `this.syncing` is true, an Obsidian `Notice` is shown ("First sync already in progress" or "Sync already in progress") and the execution aborts early.
 
 ## Interval Sync
 
@@ -219,6 +224,7 @@ Used to detect local changes without trusting `lastModified` timestamps. Returns
 
 ## Known Gaps / TODOs in Code
 
+- **CRITICAL BUG (Conflict Handling)**: In `syncImpl()`, when `conflictHandling` is `overwriteLocal` or `overwriteRemote`, `conflictActions` is populated by mapping over `conflictResolutions` instead of `conflicts`. Because `conflictResolutions` is empty in those branches, the conflict is ignored, falls through to `determineSyncActions`, and is incorrectly treated as an `upload` action (overwriting remote regardless of setting).
 - `commitSync`: TODO comment about not reverting SHA updates on sync failure
 - `determineSyncActions`: TODO in remote-deleted/local-missing case about removing remote reference
 - `isSyncable()` in `EventsListener` has an edge case: all non-configDir files pass even if outside vault root (not reachable in practice via Obsidian events)

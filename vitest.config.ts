@@ -8,6 +8,7 @@ export default defineConfig({
     setupFiles: ['./vitest.setup.ts'],
     alias: {
       obsidian: path.resolve(__dirname, './vitest.setup.ts'),
+      src: path.resolve(__dirname, './src'),
     }
   },
 });

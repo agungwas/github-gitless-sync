@@ -1,3 +1,5 @@
+---
+---
 # Plan: Rename Plugin to Gitless
 
 ## Goal

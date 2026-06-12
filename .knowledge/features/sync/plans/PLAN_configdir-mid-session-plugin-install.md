@@ -1,5 +1,8 @@
+---
+status: "done"
+completed: "2026-06-06"
+---
 # Plan: Config Dir Mid-Session Plugin Install Sync
-Status: done
 Updated by: iris-6-sync-docs 2026-06-02
 
 ## Goal

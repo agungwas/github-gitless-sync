@@ -90,3 +90,69 @@ describe('GitHubSyncPlugin - activateView', () => {
     expect(mockApp.workspace.revealLeaf).toHaveBeenCalledWith(mockNewLeaf);
   });
 });
+
+describe('GitHubSyncPlugin - sync', () => {
+  let plugin: GitHubSyncPlugin;
+  let mockApp: any;
+  let mockSyncManager: any;
+
+  beforeEach(async () => {
+    mockApp = {
+      workspace: {
+        iterateAllLeaves: vi.fn(),
+      },
+      vault: {
+        on: vi.fn(),
+      }
+    };
+
+    const manifest = { id: 'github-gitless-sync', name: 'GitHub Sync', version: '1.0.0', minAppVersion: '0.15.0', description: 'Test', author: 'Test' };
+    plugin = new GitHubSyncPlugin(mockApp as any, manifest as any);
+    plugin.app = mockApp;
+    
+    const { DEFAULT_SETTINGS } = await import('./settings/settings');
+    plugin.settings = { ...DEFAULT_SETTINGS, githubToken: 'token', githubOwner: 'owner', githubRepo: 'repo', githubBranch: 'main', firstSync: false };
+    plugin.updateStatusBarItem = vi.fn();
+    plugin.saveSettings = vi.fn();
+
+    mockSyncManager = {
+      firstSync: vi.fn(),
+      sync: vi.fn()
+    };
+    plugin.syncManager = mockSyncManager as any;
+  });
+
+  it('force saves all open TextFileView instances before syncing', async () => {
+    const mockSave1 = vi.fn().mockResolvedValue(undefined);
+    const mockSave2 = vi.fn().mockResolvedValue(undefined);
+    
+    const { TextFileView } = await import('obsidian');
+
+    const leaf1 = { view: new TextFileView() };
+    (leaf1.view as any).save = mockSave1;
+    
+    const leaf2 = { view: {} };
+    
+    const leaf3 = { view: new TextFileView() };
+    (leaf3.view as any).save = mockSave2;
+
+    mockApp.workspace.iterateAllLeaves.mockImplementation((callback: Function) => {
+      callback(leaf1);
+      callback(leaf2);
+      callback(leaf3);
+    });
+
+    // Make sure Notice is mocked appropriately
+    const { Notice } = await import('obsidian');
+    (Notice as any).mockImplementation(function() {
+      return { hide: vi.fn() };
+    });
+
+    await plugin.sync();
+
+    expect(mockApp.workspace.iterateAllLeaves).toHaveBeenCalled();
+    expect(mockSave1).toHaveBeenCalled();
+    expect(mockSave2).toHaveBeenCalled();
+    expect(mockSyncManager.sync).toHaveBeenCalled();
+  });
+});
