@@ -128,12 +128,12 @@ describe('GitHubSyncPlugin - sync', () => {
     
     const { TextFileView } = await import('obsidian');
 
-    const leaf1 = { view: new TextFileView() };
+    const leaf1 = { view: new (TextFileView as any)() };
     (leaf1.view as any).save = mockSave1;
     
     const leaf2 = { view: {} };
     
-    const leaf3 = { view: new TextFileView() };
+    const leaf3 = { view: new (TextFileView as any)() };
     (leaf3.view as any).save = mockSave2;
 
     mockApp.workspace.iterateAllLeaves.mockImplementation((callback: Function) => {
