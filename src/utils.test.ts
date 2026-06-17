@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { hasTextExtension, retryUntil } from "./utils";
+import { hasTextExtension, retryUntil, sanitizePathForLocalFilesystem } from "./utils";
 
 describe("utils", () => {
   describe("hasTextExtension", () => {
@@ -17,6 +17,43 @@ describe("utils", () => {
       expect(hasTextExtension("video.mp4")).toBe(false);
       expect(hasTextExtension("archive.zip")).toBe(false);
       expect(hasTextExtension("noextension")).toBe(false);
+    });
+  });
+
+  describe("sanitizePathForLocalFilesystem", () => {
+    it("replaces > with fullwidth equivalent", () => {
+      expect(sanitizePathForLocalFilesystem("foo >100%.md")).toBe("foo ＞100%.md");
+    });
+
+    it("replaces < with fullwidth equivalent", () => {
+      expect(sanitizePathForLocalFilesystem("Books/foo <bar>.md")).toBe("Books/foo ＜bar＞.md");
+    });
+
+    it("replaces : ? in separate segments", () => {
+      expect(sanitizePathForLocalFilesystem("a:b/c?d.md")).toBe("a：b/c？d.md");
+    });
+
+    it("is a no-op for clean paths", () => {
+      expect(sanitizePathForLocalFilesystem("clean/path.md")).toBe("clean/path.md");
+    });
+
+    it("replaces all illegal chars: * | \" \\", () => {
+      expect(sanitizePathForLocalFilesystem('star*.md')).toBe("star＊.md");
+      expect(sanitizePathForLocalFilesystem('pipe|.md')).toBe("pipe｜.md");
+      expect(sanitizePathForLocalFilesystem('quote".md')).toBe("quote＂.md");
+      expect(sanitizePathForLocalFilesystem('back\\.md')).toBe("back＼.md");
+    });
+
+    it("handles empty string", () => {
+      expect(sanitizePathForLocalFilesystem("")).toBe("");
+    });
+
+    it("is a no-op for paths with no illegal chars", () => {
+      expect(sanitizePathForLocalFilesystem("no/illegal/chars.md")).toBe("no/illegal/chars.md");
+    });
+
+    it("sanitizes each path segment independently", () => {
+      expect(sanitizePathForLocalFilesystem("seg>a/seg>b.md")).toBe("seg＞a/seg＞b.md");
     });
   });
 

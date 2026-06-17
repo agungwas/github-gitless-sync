@@ -13,7 +13,7 @@
     "isolatedModules": true,
     "strictNullChecks": true,
     "allowSyntheticDefaultImports": true,
-    "lib": ["DOM", "ES5", "ES6", "ES7"]
+    "lib": ["DOM", "ES5", "ES6", "ES7", "ES2022.Error"]
   },
   "include": ["**/*.ts", "**/*.tsx"]
 }

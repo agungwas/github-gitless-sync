@@ -9,6 +9,10 @@ export const MANIFEST_FILE_NAME = "github-sync-metadata.json" as const;
 export interface FileMetadata {
   // Local path to the file
   path: string;
+  // Sanitized local filesystem path. Set when the remote path contains
+  // characters illegal on the current platform. Undefined when local path
+  // equals remote path.
+  localPath?: string;
   // SHA of the file in the remote repository.
   // This is necessary to update the file remotely.
   // If this is null the file has not yet been pushed to the remote repository.

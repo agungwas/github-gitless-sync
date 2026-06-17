@@ -64,6 +64,28 @@ export function hasTextExtension(filePath: string) {
   return false;
 }
 
+const MOBILE_ILLEGAL_CHAR_MAP: Record<string, string> = {
+  '>': '＞',
+  '<': '＜',
+  ':': '：',
+  '"': '＂',
+  '|': '｜',
+  '?': '？',
+  '*': '＊',
+  '\\': '＼',
+};
+
+export function sanitizePathForLocalFilesystem(filePath: string): string {
+  return filePath
+    .split('/')
+    .map(segment =>
+      segment.replace(/[><:"\\|?*]/g, char => MOBILE_ILLEGAL_CHAR_MAP[char] ?? char)
+    )
+    .join('/');
+}
+
+export { MOBILE_ILLEGAL_CHAR_MAP };
+
 /**
  * Retries an async function until its return value satisfies a condition or max retries is reached.
  * Uses exponential backoff between retry attempts.

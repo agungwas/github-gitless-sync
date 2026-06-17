@@ -1,6 +1,6 @@
 ---
-last_updated: "2026-06-12"
-updated_by_plan: "plan-force-save-before-sync.md"
+last_updated: "2026-06-18"
+updated_by_plan: "plan-sanitize-mobile-filenames.md"
 decision: "2026-06-12 — Force Save Before Sync"
 ---
 # Sync Feature
@@ -29,6 +29,7 @@ interface Metadata {
 
 interface FileMetadata {
   path: string;
+  localPath?: string;         // sanitized local filesystem path; set when remote path contains platform-illegal chars
   sha: string | null;         // git blob SHA at last sync; null = never synced
   dirty: boolean;             // modified locally since last sync
   justDownloaded: boolean;    // set true on download, cleared on next FS event
@@ -58,6 +59,7 @@ Guarded by `this.syncing` flag.
 **ZIP extraction notes** (`firstSyncFromRemote`):
 - Strips first path segment (GitHub ZIP always wraps in a root dir)
 - Skips: root dir entry, configDir files if `syncConfigDir=false` (except manifest), log file, hidden files (`.`-prefixed)
+- Sanitizes path segments containing platform-illegal chars (`>`, `<`, `:`, `"`, `|`, `?`, `*`, `\`) using Unicode fullwidth lookalikes before write
 - Binary files: `vault.adapter.writeBinary()`
 - After extraction, adds any local-only metadata files to tree and commits
 
@@ -224,6 +226,7 @@ Used to detect local changes without trusting `lastModified` timestamps. Returns
 
 ## Known Gaps / TODOs in Code
 
+- **Mobile-illegal filenames abort the whole sync**: `downloadFile()` (`sync-manager.ts:1226`) writes via `vault.adapter.writeBinary(normalizedPath, ...)` with no filename sanitization. If a remote file's name contains a character the mobile OS filesystem rejects (e.g. `>` `<` `:` `"` `|` `?` `*` — legal on macOS/Linux, so the file can be created on desktop and pushed to GitHub), the mobile adapter throws `FILE_NOTCREATED` and the error propagates out of `syncImpl()` (caught at `sync-manager.ts:413`), aborting the entire sync before `commitSync()` runs. No sanitization or skip-and-continue exists anywhere in `src/`. Observed 2026-06-17 on a download of `Books/Multibagger Cara Meraih Profit >100% dari Pasar Saham.md`.
 - **CRITICAL BUG (Conflict Handling)**: In `syncImpl()`, when `conflictHandling` is `overwriteLocal` or `overwriteRemote`, `conflictActions` is populated by mapping over `conflictResolutions` instead of `conflicts`. Because `conflictResolutions` is empty in those branches, the conflict is ignored, falls through to `determineSyncActions`, and is incorrectly treated as an `upload` action (overwriting remote regardless of setting).
 - `commitSync`: TODO comment about not reverting SHA updates on sync failure
 - `determineSyncActions`: TODO in remote-deleted/local-missing case about removing remote reference

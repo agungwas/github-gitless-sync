@@ -19,7 +19,7 @@ import MetadataStore, {
 import EventsListener from "./events-listener";
 import { GitHubSyncSettings, getCommitMessageTemplate } from "./settings/settings";
 import Logger, { LOG_FILE_NAME } from "./logger";
-import { decodeBase64String, hasTextExtension } from "./utils";
+import { decodeBase64String, hasTextExtension, sanitizePathForLocalFilesystem } from "./utils";
 import GitHubSyncPlugin from "./main";
 import { BlobReader, Entry, Uint8ArrayWriter, ZipReader } from "@zip.js/zip.js";
 
@@ -230,7 +230,14 @@ export default class SyncManager {
 
       if (entry.directory) {
         const normalizedPath = normalizePath(targetPath);
-        await this.vault.adapter.mkdir(normalizedPath);
+        try {
+          await this.vault.adapter.mkdir(normalizedPath);
+        } catch (err) {
+          throw new Error(
+            `Failed to create directory ${normalizedPath}: ${err instanceof Error ? err.message : String(err)}`,
+            { cause: err },
+          );
+        }
         await this.logger.info("Created directory", {
           normalizedPath,
         });
@@ -258,14 +265,29 @@ export default class SyncManager {
       const dir = targetPath.split("/").splice(0, -1).join("/");
       if (dir !== "") {
         const normalizedDir = normalizePath(dir);
-        await this.vault.adapter.mkdir(normalizedDir);
+        try {
+          await this.vault.adapter.mkdir(normalizedDir);
+        } catch (err) {
+          throw new Error(
+            `Failed to create directory ${normalizedDir}: ${err instanceof Error ? err.message : String(err)}`,
+            { cause: err },
+          );
+        }
         await this.logger.info("Created directory", {
           normalizedDir,
         });
       }
 
       const normalizedPath = normalizePath(targetPath);
-      await this.vault.adapter.writeBinary(normalizedPath, data.buffer);
+      const sanitizedPath = normalizePath(sanitizePathForLocalFilesystem(targetPath));
+      try {
+        await this.vault.adapter.writeBinary(sanitizedPath, data.buffer);
+      } catch (err) {
+        throw new Error(
+          `Failed to write file ${sanitizedPath}: ${err instanceof Error ? err.message : String(err)}`,
+          { cause: err },
+        );
+      }
       await this.logger.info("Written file", {
         normalizedPath,
       });
@@ -275,6 +297,7 @@ export default class SyncManager {
         dirty: false,
         justDownloaded: true,
         lastModified: Date.now(),
+        ...(sanitizedPath !== normalizedPath ? { localPath: sanitizedPath } : {}),
       };
       await this.metadataStore.save();
     }
@@ -315,7 +338,14 @@ export default class SyncManager {
           // uploaded.
           let content = "binaryfile";
           if (hasTextExtension(normalizedPath)) {
-            content = await this.vault.adapter.read(normalizedPath);
+            try {
+              content = await this.vault.adapter.read(normalizedPath);
+            } catch (err) {
+              throw new Error(
+                `Failed to read file ${normalizedPath}: ${err instanceof Error ? err.message : String(err)}`,
+                { cause: err },
+              );
+            }
           }
           newTreeFiles[filePath] = {
             path: filePath,
@@ -377,7 +407,14 @@ export default class SyncManager {
           // uploaded.
           let content = "binaryfile";
           if (hasTextExtension(normalizedPath)) {
-            content = await this.vault.adapter.read(normalizedPath);
+            try {
+              content = await this.vault.adapter.read(normalizedPath);
+            } catch (err) {
+              throw new Error(
+                `Failed to read file ${normalizedPath}: ${err instanceof Error ? err.message : String(err)}`,
+                { cause: err },
+              );
+            }
           }
           newTreeFiles[filePath] = {
             path: filePath,
@@ -535,7 +572,8 @@ export default class SyncManager {
         switch (action.type) {
           case "upload": {
             const normalizedPath = normalizePath(action.filePath);
-            if (!(await this.vault.adapter.exists(normalizedPath))) {
+            const localPath = this.metadataStore.data.files[action.filePath]?.localPath ?? normalizedPath;
+            if (!(await this.vault.adapter.exists(localPath))) {
               // File was removed from disk without the delete event being tracked
               // (e.g., a plugin folder deleted via Obsidian UI). Treat as a remote
               // deletion instead so the file is removed from GitHub on next sync.
@@ -559,9 +597,19 @@ export default class SyncManager {
             // If the file was conflicting we need to read the content from the
             // conflict resolution instead of reading it from file since at this point
             // we still have not updated the local file.
-            const content =
-              resolution?.content ||
-              (await this.vault.adapter.read(normalizedPath));
+            let content: string;
+            if (resolution?.content) {
+              content = resolution.content;
+            } else {
+              try {
+                content = await this.vault.adapter.read(localPath);
+              } catch (err) {
+                throw new Error(
+                  `Failed to read file ${localPath}: ${err instanceof Error ? err.message : String(err)}`,
+                  { cause: err },
+                );
+              }
+            }
             newTreeFiles[action.filePath] = {
               path: action.filePath,
               mode: "100644",
@@ -780,7 +828,10 @@ export default class SyncManager {
       return decodeBase64String(res.content);
     } catch (err) {
       if (err.status !== 404) {
-        throw err;
+        throw new Error(
+          `Failed to fetch remote content for ${filePath}: ${err instanceof Error ? err.message : String(err)}`,
+          { cause: err },
+        );
       }
     }
 
@@ -1048,11 +1099,12 @@ export default class SyncManager {
    * @returns String containing the file SHA1 or null in case the file doesn't exist
    */
   async calculateSHA(filePath: string): Promise<string | null> {
-    if (!(await this.vault.adapter.exists(filePath))) {
+    const localPath = this.metadataStore.data.files[filePath]?.localPath ?? normalizePath(filePath);
+    if (!(await this.vault.adapter.exists(localPath))) {
       // The file doesn't exist, can't calculate any SHA
       return null;
     }
-    const contentBuffer = await this.vault.adapter.readBinary(filePath);
+    const contentBuffer = await this.vault.adapter.readBinary(localPath);
     const contentBytes = new Uint8Array(contentBuffer);
     const header = new TextEncoder().encode(`blob ${contentBytes.length}\0`);
     const store = new Uint8Array([...header, ...contentBytes]);
@@ -1149,12 +1201,29 @@ export default class SyncManager {
           // We can't upload binary files by setting the content of a tree item,
           // we first need to create a Git blob by uploading the file, then
           // we must update the tree item to point the SHA to the blob we just created.
-          const buffer = await this.vault.adapter.readBinary(filePath);
-          const { sha } = await this.client.createBlob({
-            content: arrayBufferToBase64(buffer),
-            retry: true,
-            maxRetries: 3,
-          });
+          let buffer: ArrayBuffer;
+          try {
+            buffer = await this.vault.adapter.readBinary(filePath);
+          } catch (err) {
+            throw new Error(
+              `Failed to read binary file ${filePath}: ${err instanceof Error ? err.message : String(err)}`,
+              { cause: err },
+            );
+          }
+          let sha: string;
+          try {
+            const result = await this.client.createBlob({
+              content: arrayBufferToBase64(buffer),
+              retry: true,
+              maxRetries: 3,
+            });
+            sha = result.sha;
+          } catch (err) {
+            throw new Error(
+              `Failed to upload binary blob for ${filePath}: ${err instanceof Error ? err.message : String(err)}`,
+              { cause: err },
+            );
+          }
           await this.logger.info("Created blob", filePath);
           treeFiles[filePath].sha = sha;
           // Can't have both sha and content set, so we delete it
@@ -1207,7 +1276,14 @@ export default class SyncManager {
     // Update the local content of all files that had conflicts we resolved
     await Promise.all(
       conflictResolutions.map(async (resolution) => {
-        await this.vault.adapter.write(resolution.filePath, resolution.content);
+        try {
+          await this.vault.adapter.write(resolution.filePath, resolution.content);
+        } catch (err) {
+          throw new Error(
+            `Failed to write conflict resolution for ${resolution.filePath}: ${err instanceof Error ? err.message : String(err)}`,
+            { cause: err },
+          );
+        }
         // Even though we set the last modified timestamp for all files with conflicts
         // just before pushing the changes to remote we do it here again because the
         // write right above would overwrite that.
@@ -1226,34 +1302,51 @@ export default class SyncManager {
   async downloadFile(file: GetTreeResponseItem, lastModified: number) {
     const fileMetadata = this.metadataStore.data.files[file.path];
     if (fileMetadata && fileMetadata.sha === file.sha) {
-      // File already exists and has the same SHA, no need to download it again.
       return;
     }
     const blob = await this.client.getBlob({ sha: file.sha, retry: true });
-    const normalizedPath = normalizePath(file.path);
-    const fileFolder = normalizePath(
-      normalizedPath.split("/").slice(0, -1).join("/"),
-    );
+    const sanitizedPath = normalizePath(sanitizePathForLocalFilesystem(file.path));
+    const fileFolder = normalizePath(sanitizedPath.split("/").slice(0, -1).join("/"));
     if (!(await this.vault.adapter.exists(fileFolder))) {
-      await this.vault.adapter.mkdir(fileFolder);
+      try {
+        await this.vault.adapter.mkdir(fileFolder);
+      } catch (err) {
+        throw new Error(
+          `Failed to create directory ${fileFolder}: ${err instanceof Error ? err.message : String(err)}`,
+          { cause: err },
+        );
+      }
     }
-    await this.vault.adapter.writeBinary(
-      normalizedPath,
-      base64ToArrayBuffer(blob.content),
-    );
+    try {
+      await this.vault.adapter.writeBinary(sanitizedPath, base64ToArrayBuffer(blob.content));
+    } catch (err) {
+      throw new Error(
+        `Failed to write file ${sanitizedPath}: ${err instanceof Error ? err.message : String(err)}`,
+        { cause: err },
+      );
+    }
+    const localPathDiffers = sanitizedPath !== normalizePath(file.path);
     this.metadataStore.data.files[file.path] = {
       path: file.path,
       sha: file.sha,
       dirty: false,
       justDownloaded: true,
-      lastModified: lastModified,
+      lastModified,
+      ...(localPathDiffers ? { localPath: sanitizedPath } : {}),
     };
     await this.metadataStore.save();
   }
 
   async deleteLocalFile(filePath: string) {
-    const normalizedPath = normalizePath(filePath);
-    await this.vault.adapter.remove(normalizedPath);
+    const localPath = this.metadataStore.data.files[filePath]?.localPath ?? normalizePath(filePath);
+    try {
+      await this.vault.adapter.remove(localPath);
+    } catch (err) {
+      throw new Error(
+        `Failed to delete file ${localPath}: ${err instanceof Error ? err.message : String(err)}`,
+        { cause: err },
+      );
+    }
     this.metadataStore.data.files[filePath].deleted = true;
     this.metadataStore.data.files[filePath].deletedAt = Date.now();
     this.metadataStore.save();
