@@ -1,8 +1,8 @@
 ---
 iris_schema: 4
-updated: "2026-06-18"
-updated_by_plan: "plan-sanitize-mobile-filenames.md"
-decision: "2026-06-18 — Mobile-Illegal Filename Sanitization on Download"
+last_updated: "2026-06-18"
+updated_by_plan: "plan-sanitize-remote-convergence.md"
+decision: "2026-06-18 — Converge Illegal-Char Filenames on Remote"
 ---
 # file-validation
 
@@ -34,7 +34,7 @@ In practice the iOS filesystem rejects: `>`, `<`, `:`, `"`, `|`, `?`, `*`, `\`.
 
 ### Approach
 
-**Unicode fullwidth lookalike substitution:** Replace each illegal char with its visually-similar fullwidth equivalent before writing to disk. Metadata key stays as remote path; new optional `localPath` field tracks the actual location on disk.
+**Unicode fullwidth lookalike substitution & Remote Convergence:** Replace each illegal char with its visually-similar fullwidth equivalent. To avoid divergence, the plugin converges both local disk and GitHub remote to the sanitized unicode lookalike filename.
 
 | Illegal | Lookalike | Codepoint |
 |---------|-----------|-----------|
@@ -47,7 +47,7 @@ In practice the iOS filesystem rejects: `>`, `<`, `:`, `"`, `|`, `?`, `*`, `\`.
 | `*` | `＊` | U+FF0A |
 | `\` | `＼` | U+FF3C |
 
-Applied per path **segment** (split on `/`), never to path separators.
+Applied per path **segment** (split on `/`), never to path separators. Once a file's name converges, the `localPath` indirection is no longer needed.
 
 ### Changes
 
@@ -76,6 +76,48 @@ All sites use `localPath ?? normalizedPath(filePath)` fallback pattern for grace
 | `downloadFile()` | `src/sync-manager.ts:1319` | High — called for every download action |
 | `firstSyncFromRemote()` zip extraction | `src/sync-manager.ts:283` | High — called once on first sync |
 | `vault.adapter.writeBinary()` | Obsidian API | Source of `FILE_NOTCREATED` |
+
+## Rename of sanitized files
+
+`EventsListener` has no knowledge of `localPath`. Obsidian fires vault events using the **disk path** (sanitized, e.g. `"foo ＞.md"`), but metadata is keyed by the **remote path** (with illegal chars, e.g. `"foo >.md"`).
+
+### Ghost entry bug (on download)
+
+When `downloadFile()` writes `"foo ＞.md"` to disk, Obsidian fires a `create` event for `"foo ＞.md"`. `onCreate("foo ＞.md")` looks up `metadata["foo ＞.md"]` — undefined (key is `"foo >.md"`). The `justDownloaded` check fails → ghost entry created:
+```
+metadata["foo ＞.md"] = { sha: null, dirty: true, justDownloaded: false }
+```
+On next sync: ghost triggers `upload` action → `"foo ＞.md"` (fullwidth name) pushed to GitHub as a new file — **duplicate**.
+
+### Rename path
+
+When user renames `"foo ＞.md"` → `"bar.md"`:
+- `onDelete("foo ＞.md")` → finds ghost entry → marks it `deleted: true` ✅
+- Real entry `metadata["foo >.md"]` — NOT marked deleted
+- Next sync: `calculateSHA("foo >.md")` → `localPath` file gone → null → treated as `delete_remote` (recovery at `sync-manager.ts:576-592`) ✅
+
+Net result: correct, but via indirect recovery path.
+
+### Fix surface
+
+`onCreate` and `onModify` in `events-listener.ts` should reverse-lookup by `localPath` when `metadata[file.path]` is undefined:
+```ts
+const remoteKey = Object.keys(this.metadataStore.data.files).find(
+  k => this.metadataStore.data.files[k].localPath === file.path
+) ?? file.path;
+```
+
+## Retroactive Migration & Remote Convergence (2026-06-18)
+
+To achieve full remote convergence and clean up legacy unsanitized filenames, the plugin runs a migration scan (`migrateIllegalFilenames`) at the start of every regular sync.
+
+1. **Remote/Local Renames**: Any tracked file with mobile-illegal characters in its path (including folder segments) is renamed locally on the filesystem (if it exists under the old name) and its metadata key is re-keyed to the sanitized version.
+2. **Atomic Synchronization**: The old key is soft-tombstoned (`deleted: true`) to trigger a remote deletion (`delete_remote`), while the new sanitized key is queued with `sha: null` to trigger an upload. Both operations are committed atomically in a single sync commit.
+3. **Laptop vs. Mobile**:
+   - On **laptops/desktops**, the literal `>` file on disk is physically renamed to `＞`.
+   - On **mobile devices**, the file is already stored under the sanitized name (`＞`) due to download-time sanitization, so only the local metadata store is re-keyed.
+4. **Collision Protection**: If the target sanitized name already exists in local metadata or remote metadata, the migration for that file is skipped and a warning is logged.
+5. **Conflict Resolution**: The write path during conflict resolutions in `commitSync` (`src/sync-manager.ts`) uses `localPath` fallback to avoid writing unsanitized files and throwing `FILE_NOTCREATED` on mobile.
 
 ## What is NOT the problem
 

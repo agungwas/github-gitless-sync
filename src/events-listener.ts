@@ -37,11 +37,12 @@ export default class EventsListener {
       return;
     }
 
-    const data = this.metadataStore.data.files[file.path];
+    const resolvedKey = this.resolveMetadataKey(file.path);
+    const data = this.metadataStore.data.files[resolvedKey];
     if (data && data.justDownloaded) {
       // This file was just downloaded and not created by the user.
       // It's enough to mark it as non just downloaded.
-      this.metadataStore.data.files[file.path].justDownloaded = false;
+      this.metadataStore.data.files[resolvedKey].justDownloaded = false;
       await this.metadataStore.save();
       await this.logger.info("Updated just downloaded created file", file.path);
       return;
@@ -68,12 +69,14 @@ export default class EventsListener {
       const deletedAt = Date.now();
       let changed = false;
       Object.keys(this.metadataStore.data.files).forEach((trackedPath) => {
+        const fileData = this.metadataStore.data.files[trackedPath];
+        const actualLocalPath = fileData.localPath ?? trackedPath;
         if (
-          trackedPath.startsWith(folderPrefix) &&
-          !this.metadataStore.data.files[trackedPath].deleted
+          actualLocalPath.startsWith(folderPrefix) &&
+          !fileData.deleted
         ) {
-          this.metadataStore.data.files[trackedPath].deleted = true;
-          this.metadataStore.data.files[trackedPath].deletedAt = deletedAt;
+          fileData.deleted = true;
+          fileData.deletedAt = deletedAt;
           changed = true;
         }
       });
@@ -88,13 +91,14 @@ export default class EventsListener {
       return;
     }
 
-    if (!this.metadataStore.data.files[filePath]) {
+    const resolvedKey = this.resolveMetadataKey(filePath);
+    if (!this.metadataStore.data.files[resolvedKey]) {
       // File was not tracked, nothing to update
       return;
     }
 
-    this.metadataStore.data.files[filePath].deleted = true;
-    this.metadataStore.data.files[filePath].deletedAt = Date.now();
+    this.metadataStore.data.files[resolvedKey].deleted = true;
+    this.metadataStore.data.files[resolvedKey].deletedAt = Date.now();
     await this.metadataStore.save();
     await this.logger.info("Updated deleted file", filePath);
   }
@@ -110,11 +114,14 @@ export default class EventsListener {
       // Skip folders
       return;
     }
-    const data = this.metadataStore.data.files[file.path];
-    if (data && data.justDownloaded) {
+    const resolvedKey = this.resolveMetadataKey(file.path);
+    const data = this.metadataStore.data.files[resolvedKey];
+    if (!data) return;
+
+    if (data.justDownloaded) {
       // This file was just downloaded and not modified by the user.
-      // It's enough to makr it as non just downloaded.
-      this.metadataStore.data.files[file.path].justDownloaded = false;
+      // It's enough to mark it as non just downloaded.
+      data.justDownloaded = false;
       await this.metadataStore.save();
       await this.logger.info(
         "Updated just downloaded modified file",
@@ -122,8 +129,8 @@ export default class EventsListener {
       );
       return;
     }
-    this.metadataStore.data.files[file.path].lastModified = Date.now();
-    this.metadataStore.data.files[file.path].dirty = true;
+    data.lastModified = Date.now();
+    data.dirty = true;
     await this.metadataStore.save();
     await this.logger.info("Updated modified file", file.path);
   }
@@ -155,6 +162,16 @@ export default class EventsListener {
       await this.onDelete(oldPath);
       return;
     }
+  }
+
+  private resolveMetadataKey(filePath: string): string {
+    if (this.metadataStore.data.files[filePath]) {
+      return filePath;
+    }
+    const remoteKey = Object.keys(this.metadataStore.data.files).find(
+      (key) => this.metadataStore.data.files[key].localPath === filePath,
+    );
+    return remoteKey ?? filePath;
   }
 
   private isSyncable(filePath: string) {

@@ -19,7 +19,7 @@ import MetadataStore, {
 import EventsListener from "./events-listener";
 import { GitHubSyncSettings, getCommitMessageTemplate } from "./settings/settings";
 import Logger, { LOG_FILE_NAME } from "./logger";
-import { decodeBase64String, hasTextExtension, sanitizePathForLocalFilesystem } from "./utils";
+import { decodeBase64String, hasTextExtension, sanitizePathForLocalFilesystem, pathHasMobileIllegalChars } from "./utils";
 import GitHubSyncPlugin from "./main";
 import { BlobReader, Entry, Uint8ArrayWriter, ZipReader } from "@zip.js/zip.js";
 
@@ -125,7 +125,7 @@ export default class SyncManager {
       // and contains no files.
       // 404 instead is returned in case there are no files.
       // Either way we can handle both by commiting a new empty manifest.
-      if (err.status !== 409 && err.status !== 404) {
+      if ((err as any).status !== 409 && (err as any).status !== 404) {
         this.syncing = false;
         throw err;
       }
@@ -487,7 +487,10 @@ export default class SyncManager {
     remoteMetadata.files = this.filterRemoteMetadataFiles(remoteMetadata.files);
     await this.reconcileRemoteMetadataWithTree(remoteMetadata.files, files);
 
+    const migratedOldKeys = await this.migrateIllegalFilenames(remoteMetadata.files);
+
     const conflicts = await this.findConflicts(remoteMetadata.files, files);
+    const filteredConflicts = conflicts.filter(c => !migratedOldKeys.has(c.filePath));
 
     // We treat every resolved conflict as an upload SyncAction, mainly cause
     // the user has complete freedom on the edits they can apply to the conflicting files.
@@ -499,11 +502,11 @@ export default class SyncManager {
     // commit the sync.
     let conflictResolutions: ConflictResolution[] = [];
 
-    if (conflicts.length > 0) {
-      await this.logger.warn("Found conflicts", conflicts);
+    if (filteredConflicts.length > 0) {
+      await this.logger.warn("Found conflicts", filteredConflicts);
       if (this.settings.conflictHandling === "ask") {
         // Here we block the sync process until the user has resolved all the conflicts
-        conflictResolutions = await this.onConflicts(conflicts);
+        conflictResolutions = await this.onConflicts(filteredConflicts);
         conflictActions = conflictResolutions.map(
           (resolution: ConflictResolution) => {
             return { type: "upload", filePath: resolution.filePath };
@@ -515,7 +518,7 @@ export default class SyncManager {
 
         // It's not necessary to set conflict resolutions as the content the
         // user expect must be the content of the remote file with no changes.
-        conflictActions = conflicts.map(
+        conflictActions = filteredConflicts.map(
           (conflict: ConflictFile) => {
             return { type: "download", filePath: conflict.filePath };
           },
@@ -526,7 +529,7 @@ export default class SyncManager {
 
         // It's not necessary to set conflict resolutions as the content the
         // user expect must be the content of the local file with no changes.
-        conflictActions = conflicts.map(
+        conflictActions = filteredConflicts.map(
           (conflict: ConflictFile) => {
             return { type: "upload", filePath: conflict.filePath };
           },
@@ -826,8 +829,8 @@ export default class SyncManager {
         maxRetries: 1,
       });
       return decodeBase64String(res.content);
-    } catch (err) {
-      if (err.status !== 404) {
+    } catch (err: any) {
+      if (err?.status !== 404) {
         throw new Error(
           `Failed to fetch remote content for ${filePath}: ${err instanceof Error ? err.message : String(err)}`,
           { cause: err },
@@ -864,6 +867,80 @@ export default class SyncManager {
       maxRetries: 1,
     });
     return decodeBase64String(res.content);
+  }
+
+  private async migrateIllegalFilenames(
+    remoteMetadataFiles: { [key: string]: FileMetadata },
+  ): Promise<Set<string>> {
+    const migratedOldKeys = new Set<string>();
+
+    for (const key of Object.keys(this.metadataStore.data.files)) {
+      if (this.isInternalSyncFile(key)) continue;
+
+      const entry = this.metadataStore.data.files[key];
+      if (entry.deleted) continue;
+
+      const sanitizedKey = normalizePath(sanitizePathForLocalFilesystem(key));
+      if (sanitizedKey === normalizePath(key)) continue;
+
+      // Collision guard
+      if (
+        (this.metadataStore.data.files[sanitizedKey] && !this.metadataStore.data.files[sanitizedKey].deleted) ||
+        (remoteMetadataFiles[sanitizedKey] && !remoteMetadataFiles[sanitizedKey].deleted)
+      ) {
+        this.logger.warn("Skipping migration, target exists (collision)", { key, sanitizedKey });
+        continue;
+      }
+
+      const currentDisk = entry.localPath ?? normalizePath(key);
+      const willRename = currentDisk !== sanitizedKey;
+
+      if (willRename) {
+        if (await this.vault.adapter.exists(currentDisk)) {
+          const folder = normalizePath(sanitizedKey.split("/").slice(0, -1).join("/"));
+          if (folder !== "/" && folder !== "") {
+            try {
+              const folderExists = await this.vault.adapter.exists(folder);
+              if (!folderExists) {
+                await this.vault.adapter.mkdir(folder);
+              }
+            } catch (e) {
+              this.logger.warn(`Failed to create folder for migration: ${folder}`, e);
+            }
+          }
+
+          try {
+            const buf = await this.vault.adapter.readBinary(currentDisk);
+            await this.vault.adapter.writeBinary(sanitizedKey, buf);
+            await this.vault.adapter.remove(currentDisk);
+          } catch (e) {
+            this.logger.warn(`Failed to rename file for migration: ${currentDisk} -> ${sanitizedKey}`, e);
+          }
+        } else {
+          this.logger.warn("Migration source missing on disk", currentDisk);
+        }
+      }
+
+      // Re-key metadata
+      this.metadataStore.data.files[sanitizedKey] = {
+        path: sanitizedKey,
+        sha: null,
+        dirty: true,
+        justDownloaded: willRename,
+        lastModified: Date.now(),
+      };
+
+      entry.deleted = true;
+      entry.deletedAt = Date.now();
+      migratedOldKeys.add(key);
+    }
+
+    if (migratedOldKeys.size > 0) {
+      await this.metadataStore.save();
+      this.logger.info("Migrated illegal filenames", { count: migratedOldKeys.size });
+    }
+
+    return migratedOldKeys;
   }
 
   /**
@@ -1128,7 +1205,7 @@ export default class SyncManager {
 
   private static buildCommitMessage(template: string): string {
     return template.replace(/\{([^}]+)\}/g, (match, token: string) => {
-      const formatted = moment().format(token);
+      const formatted = (moment as any)().format(token);
       return formatted === token ? match : formatted;
     });
   }
@@ -1277,7 +1354,9 @@ export default class SyncManager {
     await Promise.all(
       conflictResolutions.map(async (resolution) => {
         try {
-          await this.vault.adapter.write(resolution.filePath, resolution.content);
+          const writePath = this.metadataStore.data.files[resolution.filePath]?.localPath
+            ?? normalizePath(resolution.filePath);
+          await this.vault.adapter.write(writePath, resolution.content);
         } catch (err) {
           throw new Error(
             `Failed to write conflict resolution for ${resolution.filePath}: ${err instanceof Error ? err.message : String(err)}`,

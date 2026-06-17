@@ -1,7 +1,7 @@
 ---
 last_updated: "2026-06-18"
-updated_by_plan: "plan-sanitize-remote-convergence.md"
-decision: "2026-06-18 — Converge Illegal-Char Filenames on Remote"
+updated_by_plan: "plan-sanitize-mobile-filenames.md"
+decision: "2026-06-12 — Force Save Before Sync"
 ---
 # Sync Feature
 
@@ -75,8 +75,7 @@ syncImpl():
   3. removeVolatileArtifactsFromLocalMetadata()
   4. filterRemoteMetadataFiles()               → strip volatile from remote metadata
   5. reconcileRemoteMetadataWithTree()         → fix stale SHAs in remote metadata
-  5.5. migrateIllegalFilenames()               → migratedOldKeys (Set<string>)
-  6. findConflicts()                           → ConflictFile[] (excluding migratedOldKeys)
+  6. findConflicts()                           → ConflictFile[]
   7. resolve conflicts (per conflictHandling setting)
   8. determineSyncActions()                    → SyncAction[]
   9. apply upload/delete_remote to newTreeFiles dict
@@ -184,8 +183,8 @@ Registered after `onLayoutReady` to avoid create-event spam on startup.
 |---|---|
 | `create` | If `justDownloaded=true`: clear flag. Else: add/reset file in metadata (`sha=null, dirty=true`) |
 | `delete` (file) | Mark `deleted=true, deletedAt=now` |
-| `delete` (folder) | Mark all tracked children whose `localPath` (or path) starts with the deleted folder's prefix as `deleted=true` |
-| `modify` | If metadata is undefined: return early. Else if `justDownloaded=true`: clear flag. Else: update `lastModified`, set `dirty=true` |
+| `delete` (folder) | Mark all tracked children `deleted=true` |
+| `modify` | If `justDownloaded=true`: clear flag. Else: update `lastModified`, set `dirty=true` |
 | `rename` | `onDelete(oldPath)` + `onCreate(newFile)` |
 
 `isSyncable()` rules:

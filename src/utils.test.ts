@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { hasTextExtension, retryUntil, sanitizePathForLocalFilesystem } from "./utils";
+import { hasTextExtension, retryUntil, sanitizePathForLocalFilesystem, pathHasMobileIllegalChars } from "./utils";
 
 describe("utils", () => {
   describe("hasTextExtension", () => {
@@ -54,6 +54,23 @@ describe("utils", () => {
 
     it("sanitizes each path segment independently", () => {
       expect(sanitizePathForLocalFilesystem("seg>a/seg>b.md")).toBe("seg＞a/seg＞b.md");
+    });
+  });
+
+  describe("pathHasMobileIllegalChars", () => {
+    it("returns true for paths with illegal characters", () => {
+      expect(pathHasMobileIllegalChars("foo >100%.md")).toBe(true);
+      expect(pathHasMobileIllegalChars("Books/foo <bar>.md")).toBe(true);
+      expect(pathHasMobileIllegalChars("a:b/c?d.md")).toBe(true);
+      expect(pathHasMobileIllegalChars('star*.md')).toBe(true);
+      expect(pathHasMobileIllegalChars('pipe|.md')).toBe(true);
+      expect(pathHasMobileIllegalChars('quote".md')).toBe(true);
+      expect(pathHasMobileIllegalChars('back\\.md')).toBe(true);
+    });
+
+    it("returns false for clean paths", () => {
+      expect(pathHasMobileIllegalChars("clean/path.md")).toBe(false);
+      expect(pathHasMobileIllegalChars("")).toBe(false);
     });
   });
 

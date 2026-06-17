@@ -42,3 +42,7 @@ export const Platform = { isMobile: false };
 export class WorkspaceLeaf {}
 export class PluginSettingTab {}
 export class TextFileView {}
+export class TAbstractFile { path = ""; }
+export class TFile extends TAbstractFile {}
+export class TFolder extends TAbstractFile { children: TAbstractFile[] = []; }
+export const moment = vi.fn().mockReturnValue({ format: vi.fn((x: string) => x) });

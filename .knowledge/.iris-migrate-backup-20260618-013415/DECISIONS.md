@@ -3,21 +3,6 @@ updated: "2026-06-18"
 ---
 # Decisions
 
-## 2026-06-18 — Converge Illegal-Char Filenames on Remote
-**Chose:** Migration scan in `SyncManager` (`migrateIllegalFilenames`) reusing `justDownloaded` suppression + soft-delete tombstone, for `file-validation`. **Over:** rely on rename echo alone (fragile on mobile), hard-delete+recreate keys (breaks delete_remote → resurrects), build-fix only (leaves divergence + legacy `>` files stuck behind downloadFile early-return).
-**Why:** Soft tombstone of the old `>` key drives `delete_remote`; new `＞` key (`sha:null`) drives `upload`; one commit = atomic remote rename. `justDownloaded` set true only on laptop disk-rename so mobile's first edit isn't swallowed.
-**Plan:** ./features/file-validation/plans/plan-sanitize-remote-convergence.md
-
-## 2026-06-18 — Fix EventsListener Edge Cases (QA follow-up)
-**Chose:** Option A — fix both F1 (onModify TypeError guard) and F2 (folder delete localPath check) in one plan under `sync`. **Over:** defer F2.
-**Why:** Both are ≤4 lines, same file. Fixing while in scope is cheaper than a separate plan.
-**Plan:** ./features/sync/plans/plan-fix-events-listener-edge-cases.md
-
-## 2026-06-18 — Fix EventsListener localPath Key Mismatch
-**Chose:** Option C — `resolveMetadataKey()` reverse-lookup helper in `EventsListener` for `sync`. **Over:** Option B (inline `renameFrom` field), Option C+ (remote filename sanitization).
-**Why:** C fixes the root correctness bug (ghost entries, wrong dirty/deleted tracking for sanitized-filename files) with minimal scope. B/C+ add efficiency gains negligible for a markdown-only vault.
-**Plan:** ./features/sync/plans/plan-fix-events-localpath-lookup.md
-
 ## 2026-06-18 — Mobile-Illegal Filename Sanitization on Download
 **Chose:** Unicode fullwidth lookalike substitution (`>` → `＞`, etc.) per path segment, with optional `localPath` field on `FileMetadata`. **Over:** skip-on-download, percent-encoding, char-name substitution (`gt`).
 **Why:** Fullwidth chars are visually near-identical to originals, allowed on iOS/APFS, and don't require changing metadata keys — a new `localPath` field lets all local filesystem ops resolve the right path without touching sync comparison logic.

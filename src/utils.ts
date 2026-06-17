@@ -84,6 +84,10 @@ export function sanitizePathForLocalFilesystem(filePath: string): string {
     .join('/');
 }
 
+export function pathHasMobileIllegalChars(filePath: string): boolean {
+  return sanitizePathForLocalFilesystem(filePath) !== filePath;
+}
+
 export { MOBILE_ILLEGAL_CHAR_MAP };
 
 /**
