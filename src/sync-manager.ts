@@ -20,6 +20,7 @@ import EventsListener from "./events-listener";
 import { GitHubSyncSettings, getCommitMessageTemplate } from "./settings/settings";
 import Logger, { LOG_FILE_NAME } from "./logger";
 import { decodeBase64String, hasTextExtension, sanitizePathForLocalFilesystem, pathHasMobileIllegalChars } from "./utils";
+import { isExcludedPath } from "./sync-filters";
 import GitHubSyncPlugin from "./main";
 import { BlobReader, Entry, Uint8ArrayWriter, ZipReader } from "@zip.js/zip.js";
 
@@ -54,6 +55,9 @@ export default class SyncManager {
   // prevents multiple syncs at the same time and creation
   // of messy conflicts.
   private syncing: boolean = false;
+  // Tracks an in-flight removeExcludedFromMetadata() call so sync()/firstSync()
+  // can wait for it to finish before touching metadataStore.data.files themselves.
+  private pendingMetadataCleanup: Promise<void> | null = null;
 
   constructor(
     private vault: Vault,
@@ -99,6 +103,9 @@ export default class SyncManager {
     }
 
     this.syncing = true;
+    if (this.pendingMetadataCleanup) {
+      await this.pendingMetadataCleanup;
+    }
     try {
       await this.firstSyncImpl();
     } catch (err) {
@@ -256,6 +263,11 @@ export default class SyncManager {
         // We must skip hidden files as that creates issues with syncing.
         // This is fine as users can't edit hidden files in Obsidian anyway.
         await this.logger.info("Skipping hidden file", targetPath);
+        continue;
+      }
+
+      if (isExcludedPath(targetPath, this.settings.excludePatterns, this.settings.includePatterns)) {
+        await this.logger.info("Skipping excluded file", targetPath);
         continue;
       }
 
@@ -441,6 +453,9 @@ export default class SyncManager {
 
     const notice = new Notice("Syncing...");
     this.syncing = true;
+    if (this.pendingMetadataCleanup) {
+      await this.pendingMetadataCleanup;
+    }
     try {
       await this.syncImpl();
       // Shown only if sync doesn't fail
@@ -673,6 +688,18 @@ export default class SyncManager {
     );
   }
 
+  private shouldSkipFile(filePath: string): boolean {
+    if (filePath === `${this.vault.configDir}/${MANIFEST_FILE_NAME}`) {
+      // The manifest must never be treated as excluded, even if a user
+      // pattern would otherwise match it.
+      return false;
+    }
+    return (
+      this.isVolatileSyncArtifact(filePath) ||
+      isExcludedPath(filePath, this.settings.excludePatterns, this.settings.includePatterns)
+    );
+  }
+
   private filterRemoteMetadataFiles(filesMetadata: {
     [key: string]: FileMetadata;
   }): {
@@ -680,7 +707,7 @@ export default class SyncManager {
   } {
     return Object.keys(filesMetadata).reduce(
       (acc: { [key: string]: FileMetadata }, filePath: string) => {
-        if (this.isVolatileSyncArtifact(filePath)) {
+        if (this.shouldSkipFile(filePath)) {
           return acc;
         }
         acc[filePath] = filesMetadata[filePath];
@@ -696,7 +723,7 @@ export default class SyncManager {
   private async removeVolatileArtifactsFromLocalMetadata() {
     let changed = false;
     Object.keys(this.metadataStore.data.files).forEach((filePath: string) => {
-      if (this.isVolatileSyncArtifact(filePath)) {
+      if (this.shouldSkipFile(filePath)) {
         delete this.metadataStore.data.files[filePath];
         changed = true;
       }
@@ -728,7 +755,7 @@ export default class SyncManager {
 
     let changed = false;
     for (const filePath of configFiles) {
-      if (this.isVolatileSyncArtifact(filePath)) continue;
+      if (this.shouldSkipFile(filePath)) continue;
       if (filePath.split("/").last()?.startsWith(".")) continue;
 
       const existing = this.metadataStore.data.files[filePath];
@@ -1154,18 +1181,20 @@ export default class SyncManager {
       }
     });
 
-    if (!this.settings.syncConfigDir) {
-      // Remove all actions that involve the config directory if the user doesn't want to sync it.
-      // The manifest file is always synced.
-      return actions.filter((action: SyncAction) => {
-        return (
-          !action.filePath.startsWith(this.vault.configDir) ||
-          action.filePath === `${this.vault.configDir}/${MANIFEST_FILE_NAME}`
-        );
-      });
-    }
-
-    return actions;
+    return actions.filter((action: SyncAction) => {
+      if (action.filePath === `${this.vault.configDir}/${MANIFEST_FILE_NAME}`) {
+        // The manifest file is always synced.
+        return true;
+      }
+      if (isExcludedPath(action.filePath, this.settings.excludePatterns, this.settings.includePatterns)) {
+        return false;
+      }
+      if (!this.settings.syncConfigDir && action.filePath.startsWith(this.vault.configDir)) {
+        // Remove actions that involve the config directory if the user doesn't want to sync it.
+        return false;
+      }
+      return true;
+    });
   }
 
   /**
@@ -1454,7 +1483,7 @@ export default class SyncManager {
       }
       files.forEach((filePath: string) => {
 
-        if (this.isVolatileSyncArtifact(filePath)) {
+        if (this.shouldSkipFile(filePath)) {
           return;
         }
 
@@ -1507,7 +1536,7 @@ export default class SyncManager {
     }
     // Add them to the metadata store
     files.forEach((filePath: string) => {
-      if (this.isVolatileSyncArtifact(filePath)) {
+      if (this.shouldSkipFile(filePath)) {
         return;
       }
       this.metadataStore.data.files[filePath] = {
@@ -1552,6 +1581,43 @@ export default class SyncManager {
       delete this.metadataStore.data.files[filePath];
     });
     this.metadataStore.save();
+  }
+
+  /**
+   * Removes tracked metadata entries that currently match settings.excludePatterns
+   * (and are not overridden by settings.includePatterns). Does not touch the
+   * physical file on disk -- same non-destructive contract as removeConfigDirFromMetadata.
+   */
+  async removeExcludedFromMetadata() {
+    if (this.syncing) {
+      await this.logger.info("Skipping excluded-metadata cleanup: sync in progress");
+      return;
+    }
+    const cleanup = this.performExcludedMetadataCleanup();
+    this.pendingMetadataCleanup = cleanup;
+    try {
+      await cleanup;
+    } finally {
+      if (this.pendingMetadataCleanup === cleanup) {
+        this.pendingMetadataCleanup = null;
+      }
+    }
+  }
+
+  private async performExcludedMetadataCleanup() {
+    let changed = false;
+    Object.keys(this.metadataStore.data.files).forEach((filePath: string) => {
+      const fileMetadata = this.metadataStore.data.files[filePath];
+      const matchPath = fileMetadata.localPath ?? filePath;
+      if (this.shouldSkipFile(matchPath)) {
+        delete this.metadataStore.data.files[filePath];
+        changed = true;
+      }
+    });
+    if (changed) {
+      await this.logger.info("Removed excluded files from metadata");
+      await this.metadataStore.save();
+    }
   }
 
   getFileMetadata(filePath: string): FileMetadata {

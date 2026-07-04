@@ -37,5 +37,10 @@ describe("settings", () => {
       expect(DEFAULT_SETTINGS.syncStrategy).toBe("manual");
       expect(DEFAULT_SETTINGS.conflictHandling).toBe("ask");
     });
+
+    it("should default excludePatterns and includePatterns to empty arrays", () => {
+      expect(DEFAULT_SETTINGS.excludePatterns).toEqual([]);
+      expect(DEFAULT_SETTINGS.includePatterns).toEqual([]);
+    });
   });
 });

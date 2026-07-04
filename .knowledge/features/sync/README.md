@@ -1,7 +1,7 @@
 ---
-last_updated: "2026-06-18"
-updated_by_plan: "plan-sanitize-remote-convergence.md"
-decision: "2026-06-18 — Converge Illegal-Char Filenames on Remote"
+last_updated: "2026-07-05"
+updated_by_plan: "plan-fix-events-listener-edge-cases.md"
+decision: "2026-06-18 — Fix EventsListener Edge Cases (QA follow-up)"
 ---
 # Sync Feature
 
@@ -225,6 +225,24 @@ SHA1("blob " + byteLength + "\0" + fileBytes)
 ```
 Used to detect local changes without trusting `lastModified` timestamps. Returns `null` if file doesn't exist.
 
+## File Filtering — All Check Points (No Pattern-Based Exclusion Exists Yet)
+
+There is no user-configurable exclude-by-path/pattern feature. Filtering today is hardcoded and scattered across these call sites — any new exclude mechanism must be wired into each:
+
+| Location | Function | What it filters |
+|---|---|---|
+| `events-listener.ts:177` | `isSyncable()` | Live FS events (create/delete/modify/rename) — manifest always true, workspace/log files false, configDir gated by `syncConfigDir` |
+| `sync-manager.ts:668` | `isVolatileSyncArtifact()` | Log file + 2 workspace files — used by 4 other methods below |
+| `sync-manager.ts:676` | `filterRemoteMetadataFiles()` | Strips volatile files from remote metadata each sync |
+| `sync-manager.ts:696` | `removeVolatileArtifactsFromLocalMetadata()` | Strips volatile files from local metadata each sync |
+| `sync-manager.ts:714` | `reconcileConfigDirFiles()` | configDir walk — skips volatile + hidden (`.`-prefixed) files |
+| `sync-manager.ts:1157` (in `determineSyncActions()`) | inline filter | Drops config-dir sync actions entirely if `syncConfigDir=false` (manifest excepted) |
+| `sync-manager.ts:1434` | `loadMetadata()` | Initial full-vault scan — skips configDir folder if `syncConfigDir=false`, skips volatile files |
+| `sync-manager.ts:1494` | `addConfigDirToMetadata()` | Walk on toggle-enable — skips volatile files |
+| `sync-manager.ts:187` | `firstSyncFromRemote()` (ZIP extraction) | Skips configDir (unless `syncConfigDir=true`), log file, hidden files — path-string checks inline, not reusing `isVolatileSyncArtifact` |
+
+No single choke point exists — `isVolatileSyncArtifact` covers 5 of 9 sites, `syncConfigDir` gating is duplicated inline at 3 sites, and ZIP extraction re-implements its own checks rather than calling shared helpers.
+
 ## Known Gaps / TODOs in Code
 
 - **Mobile-illegal filenames abort the whole sync**: `downloadFile()` (`sync-manager.ts:1226`) writes via `vault.adapter.writeBinary(normalizedPath, ...)` with no filename sanitization. If a remote file's name contains a character the mobile OS filesystem rejects (e.g. `>` `<` `:` `"` `|` `?` `*` — legal on macOS/Linux, so the file can be created on desktop and pushed to GitHub), the mobile adapter throws `FILE_NOTCREATED` and the error propagates out of `syncImpl()` (caught at `sync-manager.ts:413`), aborting the entire sync before `commitSync()` runs. No sanitization or skip-and-continue exists anywhere in `src/`. Observed 2026-06-17 on a download of `Books/Multibagger Cara Meraih Profit >100% dari Pasar Saham.md`.
@@ -233,3 +251,26 @@ Used to detect local changes without trusting `lastModified` timestamps. Returns
 - `determineSyncActions`: TODO in remote-deleted/local-missing case about removing remote reference
 - `isSyncable()` in `EventsListener` has an edge case: all non-configDir files pass even if outside vault root (not reachable in practice via Obsidian events)
 - `reconcileConfigDirFiles()` not called in `firstSyncImpl()` path — if user installs plugin after startup but before first sync, `firstSyncFromLocal()` may miss those files (rare; files installed before startup are caught by `loadMetadata()` at startup)
+
+## Update 2026-07-04
+
+### Sync Notices (all `Notice()` call sites)
+
+| Site | Message | When shown |
+|---|---|---|
+| `main.ts:184` | `"Sync plugin not configured"` | required settings (`githubToken`/`Owner`/`Repo`/`Branch`) empty |
+| `main.ts:188` | `"Syncing..."` | first-sync path only, before `firstSync()` starts |
+| `main.ts:194` | `"Sync successful"` (5000ms) | first-sync path only, after `firstSync()` resolves without throwing |
+| `main.ts:198` | `"Error syncing. {err}"` | first-sync path only, `firstSync()` threw |
+| `sync-manager.ts:437` | `"Sync already in progress"` | regular sync, `this.syncing` already true — aborts early, no success/error notice follows |
+| `sync-manager.ts:442` | `"Syncing..."` | regular sync path, before `syncImpl()` starts |
+| `sync-manager.ts:448` | `"Sync successful"` (5000ms) | regular sync path, `syncImpl()` resolved without throwing |
+| `sync-manager.ts:453` | `"Error syncing. {err}"` | regular sync path, `syncImpl()` threw |
+
+No `Notice()` call in this codebase carries an icon, emoji, or checkmark prefix — every message above is plain text. There is no settings toggle that mutes/enables notices, and no per-device difference in this logic; `main.ts:167` (`sync()`) is the single entrypoint used by ribbon click, interval timer, window-focus, and window-blur triggers alike (`main.ts:148,154,160,162`).
+
+**Re: "checkmark appears sometimes, not others" report** — no code path in this plugin renders a checkmark glyph on the "Sync successful" Notice. Two real (non-config-sync) sources of the reported inconsistency:
+1. `"Sync already in progress"` fires instead of `"Sync successful"` when a second sync trigger (interval timer, window blur/focus, manual ribbon click) lands while `this.syncing` is still `true` from a prior sync — no lock, just a boolean flag (see Concurrency section). This message looks different (no success notice at all), which could read as "missing checkmark".
+2. Any perceived checkmark icon is rendered by the OS/Obsidian mobile shell around the toast, not by this plugin's code — plugin only ever passes plain strings to `new Notice(...)`.
+
+`syncConfigDir` (Config Dir Sync section above) has no code path that touches Notice display — ruled out as a cause of notice-text/icon inconsistency.

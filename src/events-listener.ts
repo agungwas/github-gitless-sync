@@ -3,6 +3,7 @@ import MetadataStore, { MANIFEST_FILE_NAME } from "./metadata-store";
 import { GitHubSyncSettings } from "./settings/settings";
 import Logger, { LOG_FILE_NAME } from "./logger";
 import GitHubSyncPlugin from "./main";
+import { isExcludedPath } from "./sync-filters";
 
 /**
  * Tracks changes to local sync directory and updates files metadata.
@@ -186,6 +187,11 @@ export default class EventsListener {
       return false;
     } else if (filePath === `${this.vault.configDir}/${LOG_FILE_NAME}`) {
       // Don't sync the log file, doesn't make sense
+      return false;
+    } else if (
+      isExcludedPath(filePath, this.settings.excludePatterns, this.settings.includePatterns)
+    ) {
+      // User-configured exclude pattern, not overridden by an include pattern
       return false;
     } else if (
       this.settings.syncConfigDir &&

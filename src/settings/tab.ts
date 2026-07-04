@@ -10,12 +10,80 @@ import GitHubSyncPlugin from "src/main";
 import { copyToClipboard } from "src/utils";
 import { getCommitMessageTemplate, setCommitMessageTemplate } from "src/settings/settings";
 
+const METADATA_CLEANUP_DEBOUNCE_MS = 400;
+
 export default class GitHubSyncSettingsTab extends PluginSettingTab {
   plugin: GitHubSyncPlugin;
+  private metadataCleanupTimer: number | undefined;
 
   constructor(app: App, plugin: GitHubSyncPlugin) {
     super(app, plugin);
     this.plugin = plugin;
+  }
+
+  /**
+   * Debounces the expensive full-metadata-store rescan triggered by pattern
+   * edits -- settings themselves are still saved immediately on every
+   * keystroke (see renderPatternList), only this reconciliation pass waits
+   * for typing to pause.
+   */
+  private scheduleMetadataCleanup() {
+    if (this.metadataCleanupTimer !== undefined) {
+      window.clearTimeout(this.metadataCleanupTimer);
+    }
+    this.metadataCleanupTimer = window.setTimeout(async () => {
+      await this.plugin.syncManager.removeExcludedFromMetadata();
+    }, METADATA_CLEANUP_DEBOUNCE_MS);
+  }
+
+  /**
+   * Renders a dynamic list of glob pattern rows: typing into the last (blank)
+   * row appends a new blank row below it, and every non-last row gets a
+   * delete button. Shared by the Sync Exclusions and Sync Inclusions lists.
+   */
+  private renderPatternList(
+    containerEl: HTMLElement,
+    patterns: string[],
+    placeholder: string,
+  ) {
+    if (patterns.length === 0 || patterns[patterns.length - 1].trim() !== "") {
+      patterns.push("");
+    }
+
+    const onPatternDeleted = async () => {
+      await this.plugin.saveSettings();
+      await this.plugin.syncManager.removeExcludedFromMetadata();
+    };
+
+    patterns.forEach((pattern, index) => {
+      const isLastRow = index === patterns.length - 1;
+      const row = new Setting(containerEl).addText((text) =>
+        text
+          .setPlaceholder(placeholder)
+          .setValue(pattern)
+          .onChange(async (value) => {
+            patterns[index] = value;
+            await this.plugin.saveSettings();
+            this.scheduleMetadataCleanup();
+            if (isLastRow && value.trim() !== "") {
+              this.display();
+            }
+          }),
+      );
+
+      if (!isLastRow) {
+        row.addButton((button) =>
+          button
+            .setIcon("trash")
+            .setTooltip("Remove")
+            .onClick(async () => {
+              patterns.splice(index, 1);
+              await onPatternDeleted();
+              this.display();
+            }),
+        );
+      }
+    });
   }
 
   display(): void {
@@ -192,6 +260,24 @@ export default class GitHubSyncSettingsTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           });
       });
+
+    new Setting(containerEl)
+      .setName("Sync exclusions")
+      .setDesc("Files matching these patterns are never synced.")
+      .setHeading();
+    this.renderPatternList(containerEl, this.plugin.settings.excludePatterns, "e.g. **/main.js");
+
+    new Setting(containerEl)
+      .setName("Sync inclusions")
+      .setDesc(
+        "Files matching these patterns are always synced, even if also matched by an exclusion above.",
+      )
+      .setHeading();
+    this.renderPatternList(
+      containerEl,
+      this.plugin.settings.includePatterns,
+      "e.g. gitless/**/main.js",
+    );
 
     new Setting(containerEl).setName("Device Specific").setHeading();
 

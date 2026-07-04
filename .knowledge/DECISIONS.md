@@ -1,7 +1,12 @@
 ---
-updated: "2026-06-18"
+updated: "2026-07-04"
 ---
 # Decisions
+
+## 2026-07-04 — Exclude Files/Folders From Sync by Pattern
+**Chose:** Gitignore-style glob (`*`, `**`, trailing `/`) across two separate settings arrays — `excludePatterns` + `includePatterns` (include always wins) — matched via one centralized pure function (`isExcludedPath`), reused at all 9 existing filter call-sites, for `sync`. **Over:** simple wildcard-only glob (imprecise), raw JS regex per row (wrong audience), single ordered list with `!`-prefix negation (order-dependent, harder to explain in UI than two plain lists).
+**Why:** Glob has ecosystem precedent (Obsidian Git plugin ships the same feature); two independent lists avoid order-dependence entirely; centralizing touches the 9 scattered filter sites mapped by `iris-0a-explore` once instead of twice.
+**Plan:** ./features/sync/plans/plan-exclude-patterns.md
 
 ## 2026-06-18 — Converge Illegal-Char Filenames on Remote
 **Chose:** Migration scan in `SyncManager` (`migrateIllegalFilenames`) reusing `justDownloaded` suppression + soft-delete tombstone, for `file-validation`. **Over:** rely on rename echo alone (fragile on mobile), hard-delete+recreate keys (breaks delete_remote → resurrects), build-fix only (leaves divergence + legacy `>` files stuck behind downloadFile early-return).

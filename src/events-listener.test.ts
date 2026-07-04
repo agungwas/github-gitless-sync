@@ -18,8 +18,12 @@ function makeVault(configDir = ".obsidian") {
   return { configDir };
 }
 
-function makeSettings(syncConfigDir = false) {
-  return { syncConfigDir };
+function makeSettings(
+  syncConfigDir = false,
+  excludePatterns: string[] = [],
+  includePatterns: string[] = [],
+) {
+  return { syncConfigDir, excludePatterns, includePatterns };
 }
 
 function makeFile(path: string): TFile {
@@ -103,6 +107,42 @@ describe("EventsListener — edge cases (plan-fix-events-listener-edge-cases)", 
       await onDelete(makeFolder("notes"));
 
       expect(metadataStore.data.files["notes/foo.md"].deleted).toBe(true);
+    });
+  });
+
+  describe("Exclude/include patterns (plan-exclude-patterns)", () => {
+    it("isSyncable returns false for a path matching an exclude pattern", () => {
+      const excludedListener = new EventsListener(
+        makeVault() as any,
+        metadataStore as any,
+        makeSettings(false, ["**/main.js"]) as any,
+        makeLogger() as any,
+      );
+      const isSyncable = excludedListener["isSyncable"].bind(excludedListener);
+      expect(isSyncable(".obsidian/plugins/foo/main.js")).toBe(false);
+    });
+
+    it("isSyncable returns true when an include pattern overrides the exclude", () => {
+      const overriddenListener = new EventsListener(
+        makeVault() as any,
+        metadataStore as any,
+        makeSettings(false, ["**/main.js"], ["gitless/**/main.js"]) as any,
+        makeLogger() as any,
+      );
+      const isSyncable = overriddenListener["isSyncable"].bind(overriddenListener);
+      expect(isSyncable("gitless/plugins/foo/main.js")).toBe(true);
+    });
+
+    it("onCreate never tracks a file matching an exclude pattern", async () => {
+      const excludedListener = new EventsListener(
+        makeVault() as any,
+        metadataStore as any,
+        makeSettings(false, ["**/main.js"]) as any,
+        makeLogger() as any,
+      );
+      const onCreate = excludedListener["onCreate"].bind(excludedListener);
+      await onCreate(makeFile(".obsidian/plugins/foo/main.js"));
+      expect(metadataStore.data.files[".obsidian/plugins/foo/main.js"]).toBeUndefined();
     });
   });
 

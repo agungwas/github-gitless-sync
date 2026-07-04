@@ -185,7 +185,7 @@ describe('SyncManager - Sanitize Remote Convergence Migration', () => {
   });
 
   it('T8: conflict exclusion filters out migrated old keys', async () => {
-    (syncManager as any).settings = { conflictHandling: 'overwriteLocal' };
+    (syncManager as any).settings = { conflictHandling: 'overwriteLocal', excludePatterns: [], includePatterns: [] };
     (syncManager as any).client = {
       getTree: vi.fn().mockResolvedValue({ tree: [{ path: 'other.md', sha: 'some_sha' }] }),
       getCommit: vi.fn(),

@@ -5,6 +5,29 @@ import { GitHubSyncSettings } from './settings/settings';
 import Logger from './logger';
 import { GetTreeResponseItem } from './github/client';
 
+let mockZipEntries: Array<{ filename: string; directory: boolean; getData?: (writer: any) => Promise<void> }> = [];
+vi.mock('@zip.js/zip.js', () => ({
+  BlobReader: function BlobReader() {},
+  ZipReader: function ZipReader() {
+    (this as any).getEntries = () => Promise.resolve(mockZipEntries);
+  },
+  Uint8ArrayWriter: function Uint8ArrayWriter() {
+    (this as any).getData = () => Promise.resolve(new Uint8Array());
+  },
+}));
+
+if (!(Array.prototype as any).last) {
+  (Array.prototype as any).last = function () {
+    return this[this.length - 1];
+  };
+}
+if (!(Array.prototype as any).contains) {
+  (Array.prototype as any).contains = Array.prototype.includes;
+}
+if (!(Notice.prototype as any).hide) {
+  (Notice.prototype as any).hide = vi.fn();
+}
+
 describe('SyncManager - Sync in Progress Notice', () => {
   let syncManager: SyncManager;
   let mockVault: Vault;
@@ -370,6 +393,329 @@ describe('SyncManager - Filename Context in Filesystem Error Messages', () => {
         expect(mockVault.adapter.remove).toHaveBeenCalledWith('Books/Multibagger ＞100%.md');
         expect(mockVault.adapter.remove).not.toHaveBeenCalledWith('Books/Multibagger >100%.md');
       });
+    });
+  });
+
+  describe('shouldSkipFile (plan-exclude-patterns)', () => {
+    it('returns true for a volatile artifact regardless of patterns', () => {
+      (syncManager as any).settings = { ...mockSettings, excludePatterns: [], includePatterns: [] };
+      const shouldSkipFile = (syncManager as any).shouldSkipFile.bind(syncManager);
+      expect(shouldSkipFile('.obsidian/workspace.json')).toBe(true);
+    });
+
+    it('returns true for a path matching an exclude pattern', () => {
+      (syncManager as any).settings = { ...mockSettings, excludePatterns: ['**/main.js'], includePatterns: [] };
+      const shouldSkipFile = (syncManager as any).shouldSkipFile.bind(syncManager);
+      expect(shouldSkipFile('.obsidian/plugins/foo/main.js')).toBe(true);
+    });
+
+    it('returns false when an include pattern overrides the exclude', () => {
+      (syncManager as any).settings = {
+        ...mockSettings,
+        excludePatterns: ['**/main.js'],
+        includePatterns: ['gitless/**/main.js'],
+      };
+      const shouldSkipFile = (syncManager as any).shouldSkipFile.bind(syncManager);
+      expect(shouldSkipFile('gitless/plugins/foo/main.js')).toBe(false);
+    });
+
+    it('returns false for an ordinary note with no matching pattern', () => {
+      (syncManager as any).settings = { ...mockSettings, excludePatterns: ['**/main.js'], includePatterns: [] };
+      const shouldSkipFile = (syncManager as any).shouldSkipFile.bind(syncManager);
+      expect(shouldSkipFile('notes/todo.md')).toBe(false);
+    });
+  });
+
+  describe('filterRemoteMetadataFiles with exclude patterns (plan-exclude-patterns)', () => {
+    it('strips a path matching an exclude pattern from remote metadata', () => {
+      (syncManager as any).settings = { ...mockSettings, excludePatterns: ['**/main.js'], includePatterns: [] };
+      const filterRemoteMetadataFiles = (syncManager as any).filterRemoteMetadataFiles.bind(syncManager);
+      const result = filterRemoteMetadataFiles({
+        'notes/todo.md': { path: 'notes/todo.md' },
+        '.obsidian/plugins/foo/main.js': { path: '.obsidian/plugins/foo/main.js' },
+      });
+      expect(Object.keys(result)).toEqual(['notes/todo.md']);
+    });
+  });
+
+  describe('reconcileConfigDirFiles with exclude patterns (plan-exclude-patterns)', () => {
+    it('does not track a configDir file matching an exclude pattern', async () => {
+      (syncManager as any).settings = {
+        ...mockSettings,
+        syncConfigDir: true,
+        excludePatterns: ['**/main.js'],
+        includePatterns: [],
+      };
+      (syncManager as any).metadataStore = {
+        data: { files: {} },
+        save: vi.fn().mockResolvedValue(undefined),
+      };
+      (mockVault.adapter.list as ReturnType<typeof vi.fn>).mockImplementation((folder: string) => {
+        if (folder === '.obsidian') {
+          return Promise.resolve({ files: ['.obsidian/plugins/foo/main.js'], folders: [] });
+        }
+        return Promise.resolve({ files: [], folders: [] });
+      });
+
+      const reconcileConfigDirFiles = (syncManager as any).reconcileConfigDirFiles.bind(syncManager);
+      await reconcileConfigDirFiles();
+
+      expect((syncManager as any).metadataStore.data.files['.obsidian/plugins/foo/main.js']).toBeUndefined();
+    });
+  });
+
+  describe('determineSyncActions with exclude patterns (plan-exclude-patterns)', () => {
+    it('drops an upload/download action for a file matching an exclude pattern, even when already tracked both sides', async () => {
+      (syncManager as any).settings = { ...mockSettings, excludePatterns: ['**/main.js'], includePatterns: [] };
+      (syncManager as any).calculateSHA = vi.fn().mockResolvedValue('actual-sha-on-disk');
+
+      const remoteFiles = {
+        'vendor/foo/main.js': { path: 'vendor/foo/main.js', sha: 'remote-sha' },
+      };
+      const localFiles = {
+        'vendor/foo/main.js': { path: 'vendor/foo/main.js', sha: 'old-local-sha' },
+      };
+
+      const actions = await syncManager.determineSyncActions(remoteFiles as any, localFiles as any, []);
+
+      expect(actions).toEqual([]);
+    });
+
+    it('still produces an upload action for a non-excluded file with the same shape', async () => {
+      (syncManager as any).settings = { ...mockSettings, excludePatterns: ['**/main.js'], includePatterns: [] };
+      (syncManager as any).calculateSHA = vi.fn().mockResolvedValue('actual-sha-on-disk');
+
+      const remoteFiles = {
+        'notes/todo.md': { path: 'notes/todo.md', sha: 'remote-sha' },
+      };
+      const localFiles = {
+        'notes/todo.md': { path: 'notes/todo.md', sha: 'old-local-sha' },
+      };
+
+      const actions = await syncManager.determineSyncActions(remoteFiles as any, localFiles as any, []);
+
+      expect(actions).toEqual([{ type: 'upload', filePath: 'notes/todo.md' }]);
+    });
+  });
+
+  describe('firstSyncFromRemote with exclude patterns (plan-exclude-patterns)', () => {
+    it('never writes an excluded file to disk during ZIP extraction', async () => {
+      (syncManager as any).settings = { ...mockSettings, excludePatterns: ['**/main.js'], includePatterns: [] };
+      (syncManager as any).metadataStore = {
+        data: { files: {} },
+        save: vi.fn().mockResolvedValue(undefined),
+      };
+      (syncManager as any).client = {
+        downloadRepositoryArchive: vi.fn().mockResolvedValue(new ArrayBuffer(0)),
+      };
+      (syncManager as any).commitSync = vi.fn().mockResolvedValue(undefined);
+      (mockVault.adapter.mkdir as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+      (mockVault.adapter.writeBinary as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+
+      mockZipEntries = [
+        {
+          filename: 'repo-root/vendor/foo/main.js',
+          directory: false,
+          getData: vi.fn().mockResolvedValue(undefined),
+        },
+        {
+          filename: 'repo-root/notes/todo.md',
+          directory: false,
+          getData: vi.fn().mockResolvedValue(undefined),
+        },
+      ];
+
+      await (syncManager as any).firstSyncFromRemote(
+        {
+          'vendor/foo/main.js': { path: 'vendor/foo/main.js', sha: 'sha-main' },
+          'notes/todo.md': { path: 'notes/todo.md', sha: 'sha-todo' },
+        },
+        'tree-sha',
+      );
+
+      expect(mockVault.adapter.writeBinary).not.toHaveBeenCalledWith(
+        expect.stringContaining('main.js'),
+        expect.anything(),
+      );
+      expect(mockVault.adapter.writeBinary).toHaveBeenCalledWith(
+        'notes/todo.md',
+        expect.anything(),
+      );
+    });
+  });
+
+  describe('removeExcludedFromMetadata (plan-exclude-patterns)', () => {
+    it('deletes tracked entries matching the current exclude patterns, leaves others', async () => {
+      (syncManager as any).settings = { ...mockSettings, excludePatterns: ['**/main.js'], includePatterns: [] };
+      (syncManager as any).metadataStore = {
+        data: {
+          files: {
+            'vendor/foo/main.js': { path: 'vendor/foo/main.js', sha: 'abc' },
+            'notes/todo.md': { path: 'notes/todo.md', sha: 'def' },
+          },
+        },
+        save: vi.fn().mockResolvedValue(undefined),
+      };
+
+      await syncManager.removeExcludedFromMetadata();
+
+      expect((syncManager as any).metadataStore.data.files['vendor/foo/main.js']).toBeUndefined();
+      expect((syncManager as any).metadataStore.data.files['notes/todo.md']).toBeDefined();
+      expect((syncManager as any).metadataStore.save).toHaveBeenCalled();
+    });
+
+    it('matches against localPath when the entry has a sanitized local filesystem path', async () => {
+      (syncManager as any).settings = { ...mockSettings, excludePatterns: ['**/main.js'], includePatterns: [] };
+      (syncManager as any).metadataStore = {
+        data: {
+          files: {
+            'vendor/foo>bar/main.js': { path: 'vendor/foo>bar/main.js', localPath: 'vendor/foo＞bar/main.js', sha: 'abc' },
+          },
+        },
+        save: vi.fn().mockResolvedValue(undefined),
+      };
+
+      await syncManager.removeExcludedFromMetadata();
+
+      expect((syncManager as any).metadataStore.data.files['vendor/foo>bar/main.js']).toBeUndefined();
+    });
+
+    it('never touches any vault adapter API (non-destructive to physical files)', async () => {
+      (syncManager as any).settings = { ...mockSettings, excludePatterns: ['**/main.js'], includePatterns: [] };
+      (syncManager as any).metadataStore = {
+        data: { files: { 'vendor/foo/main.js': { path: 'vendor/foo/main.js', sha: 'abc' } } },
+        save: vi.fn().mockResolvedValue(undefined),
+      };
+
+      await syncManager.removeExcludedFromMetadata();
+
+      expect(mockVault.adapter.remove).not.toHaveBeenCalled();
+      expect(mockVault.adapter.writeBinary).not.toHaveBeenCalled();
+    });
+
+    it('does not save metadata when nothing changed', async () => {
+      (syncManager as any).settings = { ...mockSettings, excludePatterns: ['**/main.js'], includePatterns: [] };
+      (syncManager as any).metadataStore = {
+        data: { files: { 'notes/todo.md': { path: 'notes/todo.md', sha: 'def' } } },
+        save: vi.fn().mockResolvedValue(undefined),
+      };
+
+      await syncManager.removeExcludedFromMetadata();
+
+      expect((syncManager as any).metadataStore.save).not.toHaveBeenCalled();
+    });
+
+    it('never deletes the manifest entry, even when a pattern matches its path (plan-fix-exclude-patterns-qa-findings)', async () => {
+      const manifestPath = `${mockVault.configDir}/github-sync-metadata.json`;
+      (syncManager as any).settings = { ...mockSettings, excludePatterns: ['**/*.json'], includePatterns: [] };
+      (syncManager as any).metadataStore = {
+        data: {
+          files: {
+            [manifestPath]: { path: manifestPath, sha: 'manifest-sha' },
+          },
+        },
+        save: vi.fn().mockResolvedValue(undefined),
+      };
+
+      await syncManager.removeExcludedFromMetadata();
+
+      expect((syncManager as any).metadataStore.data.files[manifestPath]).toBeDefined();
+    });
+
+    it('is a no-op while a sync is in progress (plan-fix-exclude-patterns-qa-findings)', async () => {
+      (syncManager as any).settings = { ...mockSettings, excludePatterns: ['**/main.js'], includePatterns: [] };
+      (syncManager as any).metadataStore = {
+        data: { files: { 'vendor/foo/main.js': { path: 'vendor/foo/main.js', sha: 'abc' } } },
+        save: vi.fn().mockResolvedValue(undefined),
+      };
+      (syncManager as any).syncing = true;
+
+      await syncManager.removeExcludedFromMetadata();
+
+      expect((syncManager as any).metadataStore.data.files['vendor/foo/main.js']).toBeDefined();
+      expect((syncManager as any).metadataStore.save).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('sync race guard (plan-harden-exclude-patterns)', () => {
+    function makeDeferred<T>() {
+      let resolve!: (value: T) => void;
+      const promise = new Promise<T>((res) => { resolve = res; });
+      return { promise, resolve };
+    }
+
+    it('sync() awaits an in-flight removeExcludedFromMetadata() cleanup before proceeding', async () => {
+      (syncManager as any).settings = { ...mockSettings, excludePatterns: ['**/main.js'], includePatterns: [] };
+      const deferredSave = makeDeferred<void>();
+      (syncManager as any).metadataStore = {
+        data: { files: { 'vendor/foo/main.js': { path: 'vendor/foo/main.js', sha: 'abc' } } },
+        save: vi.fn().mockImplementation(() => deferredSave.promise),
+      };
+      (syncManager as any).syncImpl = vi.fn().mockResolvedValue(undefined);
+
+      const cleanupPromise = syncManager.removeExcludedFromMetadata();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      const syncPromise = syncManager.sync();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect((syncManager as any).syncImpl).not.toHaveBeenCalled();
+
+      deferredSave.resolve();
+      await cleanupPromise;
+      await syncPromise;
+
+      expect((syncManager as any).syncImpl).toHaveBeenCalledTimes(1);
+    });
+
+    it('firstSync() awaits an in-flight removeExcludedFromMetadata() cleanup before proceeding', async () => {
+      (syncManager as any).settings = { ...mockSettings, excludePatterns: ['**/main.js'], includePatterns: [] };
+      const deferredSave = makeDeferred<void>();
+      (syncManager as any).metadataStore = {
+        data: { files: { 'vendor/foo/main.js': { path: 'vendor/foo/main.js', sha: 'abc' } } },
+        save: vi.fn().mockImplementation(() => deferredSave.promise),
+      };
+      (syncManager as any).firstSyncImpl = vi.fn().mockResolvedValue(undefined);
+
+      const cleanupPromise = syncManager.removeExcludedFromMetadata();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      const firstSyncPromise = syncManager.firstSync();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect((syncManager as any).firstSyncImpl).not.toHaveBeenCalled();
+
+      deferredSave.resolve();
+      await cleanupPromise;
+      await firstSyncPromise;
+
+      expect((syncManager as any).firstSyncImpl).toHaveBeenCalledTimes(1);
+    });
+
+    it('sync() proceeds immediately when no cleanup is pending', async () => {
+      (syncManager as any).syncImpl = vi.fn().mockResolvedValue(undefined);
+
+      await syncManager.sync();
+
+      expect((syncManager as any).syncImpl).toHaveBeenCalledTimes(1);
+    });
+
+    it('clears pendingMetadataCleanup after the cleanup resolves', async () => {
+      (syncManager as any).settings = { ...mockSettings, excludePatterns: ['**/main.js'], includePatterns: [] };
+      (syncManager as any).metadataStore = {
+        data: { files: { 'vendor/foo/main.js': { path: 'vendor/foo/main.js', sha: 'abc' } } },
+        save: vi.fn().mockResolvedValue(undefined),
+      };
+
+      await syncManager.removeExcludedFromMetadata();
+
+      expect((syncManager as any).pendingMetadataCleanup).toBeNull();
     });
   });
 
