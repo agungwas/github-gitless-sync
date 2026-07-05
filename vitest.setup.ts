@@ -45,4 +45,13 @@ export class TextFileView {}
 export class TAbstractFile { path = ""; }
 export class TFile extends TAbstractFile {}
 export class TFolder extends TAbstractFile { children: TAbstractFile[] = []; }
+export class Modal {
+  app: unknown;
+  contentEl = { createEl: () => ({ createEl: () => ({}) }), empty: () => {} };
+  constructor(app: unknown) { this.app = app; }
+  setTitle() { return this; }
+  setContent() { return this; }
+  open() {}
+  close() {}
+}
 export const moment = vi.fn().mockReturnValue({ format: vi.fn((x: string) => x) });

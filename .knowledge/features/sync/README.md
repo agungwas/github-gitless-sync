@@ -225,23 +225,40 @@ SHA1("blob " + byteLength + "\0" + fileBytes)
 ```
 Used to detect local changes without trusting `lastModified` timestamps. Returns `null` if file doesn't exist.
 
-## File Filtering — All Check Points (No Pattern-Based Exclusion Exists Yet)
+## File Filtering — Pattern-Based Exclusion (`excludePatterns` / `includePatterns`)
 
-There is no user-configurable exclude-by-path/pattern feature. Filtering today is hardcoded and scattered across these call sites — any new exclude mechanism must be wired into each:
+Added 2026-07-04 (`plan-exclude-patterns.md`), hardened 2026-07-05 (`plan-fix-exclude-patterns-qa-findings.md`, `plan-harden-exclude-patterns.md`). Two settings arrays, gitignore-style glob (`*`, `**`, trailing `/` = dir + everything under it), matched by the pure function `isExcludedPath(filePath, excludePatterns, includePatterns)` in `src/sync-filters.ts`:
+
+```
+isExcludedPath = matchesAny(filePath, excludePatterns) && !matchesAny(filePath, includePatterns)
+```
+
+Include always wins regardless of list order or edit recency. Blank/whitespace entries and patterns over `MAX_PATTERN_LENGTH` (500 chars) are ignored, never treated as match-all. The glob matcher (`matchSegment` + `matchSegmentSequence` in `sync-filters.ts`) is a two-pointer/DP implementation, not backtracking regex — deliberately built this way to stay `O(n*m)` and immune to ReDoS on adversarial patterns.
+
+`shouldSkipFile(filePath)` in `sync-manager.ts:691` is the single choke point: manifest path is always exempt (checked first, before pattern matching), then `isVolatileSyncArtifact()` (log file, 2 workspace files), then `isExcludedPath()`. All 9 filtering call sites route through it:
 
 | Location | Function | What it filters |
 |---|---|---|
-| `events-listener.ts:177` | `isSyncable()` | Live FS events (create/delete/modify/rename) — manifest always true, workspace/log files false, configDir gated by `syncConfigDir` |
-| `sync-manager.ts:668` | `isVolatileSyncArtifact()` | Log file + 2 workspace files — used by 4 other methods below |
-| `sync-manager.ts:676` | `filterRemoteMetadataFiles()` | Strips volatile files from remote metadata each sync |
-| `sync-manager.ts:696` | `removeVolatileArtifactsFromLocalMetadata()` | Strips volatile files from local metadata each sync |
-| `sync-manager.ts:714` | `reconcileConfigDirFiles()` | configDir walk — skips volatile + hidden (`.`-prefixed) files |
-| `sync-manager.ts:1157` (in `determineSyncActions()`) | inline filter | Drops config-dir sync actions entirely if `syncConfigDir=false` (manifest excepted) |
-| `sync-manager.ts:1434` | `loadMetadata()` | Initial full-vault scan — skips configDir folder if `syncConfigDir=false`, skips volatile files |
-| `sync-manager.ts:1494` | `addConfigDirToMetadata()` | Walk on toggle-enable — skips volatile files |
-| `sync-manager.ts:187` | `firstSyncFromRemote()` (ZIP extraction) | Skips configDir (unless `syncConfigDir=true`), log file, hidden files — path-string checks inline, not reusing `isVolatileSyncArtifact` |
+| `events-listener.ts:192` | `isSyncable()` | Live FS events (create/delete/modify/rename) |
+| `sync-manager.ts:269` | (ZIP extraction, `firstSyncFromRemote()`) | Skips excluded entries when writing to disk |
+| `sync-manager.ts:699` / `filterRemoteMetadataFiles()` | Strips excluded + volatile files from remote metadata each sync |
+| `sync-manager.ts:726` / `removeVolatileArtifactsFromLocalMetadata()` | Strips excluded + volatile files from local metadata each sync |
+| `sync-manager.ts:758` / `reconcileConfigDirFiles()` | configDir walk — skips excluded/volatile + hidden (`.`-prefixed) files |
+| `sync-manager.ts:1189` (in `determineSyncActions()`) | inline filter | Drops sync actions for excluded paths |
+| `sync-manager.ts:1486`, `1539` | `loadMetadata()` / `addConfigDirToMetadata()` | Initial/toggle-enable scans skip excluded files |
+| `sync-manager.ts:1612` | `performExcludedMetadataCleanup()` (via `removeExcludedFromMetadata()`) | Settings-triggered reconciliation, see below |
 
-No single choke point exists — `isVolatileSyncArtifact` covers 5 of 9 sites, `syncConfigDir` gating is duplicated inline at 3 sites, and ZIP extraction re-implements its own checks rather than calling shared helpers.
+### Settings-triggered metadata cleanup (`removeExcludedFromMetadata`)
+
+Called from `src/settings/tab.ts` on every pattern-row edit/delete (debounced 400ms via `scheduleMetadataCleanup()` for typing; immediate on row delete). Guarded by `this.syncing` — skipped if a sync is already in flight; the in-flight promise is tracked in `pendingMetadataCleanup` so `sync()`/`firstSync()` can await it before proceeding (added 2026-07-05 hardening pass to close a metadata-mutation race).
+
+`performExcludedMetadataCleanup()` deletes any `metadataStore.data.files` entry whose path (or `localPath` if the file was sanitized for illegal chars) now matches `shouldSkipFile()`. **This only removes the local tracking entry — it never touches the physical local file, and it never issues a remote delete.** Confirmed as intended design in `plan-exclude-patterns.md` Edge Cases table: "Pattern added that matches an already-tracked file → File dropped from local+remote metadata via `removeExcludedFromMetadata()` on next settings change; physical local file untouched."
+
+**Net effect on a file already synced to GitHub before being excluded:** on the next regular sync, `filterRemoteMetadataFiles()` strips the file from `remoteMetadata.files` and the local cleanup above strips it from `metadataStore.data.files`. With no metadata entry on either side, `determineSyncActions()` (`sync-manager.ts:1068`) never emits an action for that path — no upload, download, or `delete_remote`. Meanwhile `newTreeFiles` (`sync-manager.ts:571`) is seeded from the **raw, unfiltered** GitHub tree returned by `getRepoContent()`, so the file's existing blob entry is carried into every subsequent commit unchanged. **The file is never removed from the remote repo by excluding it** — exclusion only stops future sync consideration of the path; a file already on GitHub before the pattern was added stays there indefinitely.
+
+### Settings UI mechanics (`src/settings/tab.ts`, `renderPatternList()`)
+
+Exclude/include lists are each rendered as N rows + one trailing always-blank row. Every keystroke in any row calls `this.plugin.saveSettings()` immediately, then `scheduleMetadataCleanup()` (debounced). If the edited row is the trailing blank row and its new value is non-blank, `renderPatternList` additionally calls `this.display()` synchronously on that same keystroke — `display()` does `containerEl.empty()` then rebuilds the entire settings tab DOM from scratch (all sections, not just the pattern lists), which drops focus from whatever input the user was typing into (confirmed behavior, no `+`/add-row button exists — new-row growth is implicit-on-type only).
 
 ## Known Gaps / TODOs in Code
 

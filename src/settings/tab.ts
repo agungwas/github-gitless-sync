@@ -12,6 +12,60 @@ import { getCommitMessageTemplate, setCommitMessageTemplate } from "src/settings
 
 const METADATA_CLEANUP_DEBOUNCE_MS = 400;
 
+/**
+ * Splits every vault path into "will sync" / "excluded" per the given
+ * predicate -- pure so it's testable without a Modal or real vault.
+ */
+export function bucketPathsByPattern(
+  paths: string[],
+  isPathSyncable: (path: string) => boolean,
+): { willSync: string[]; excluded: string[] } {
+  const willSync: string[] = [];
+  const excluded: string[] = [];
+  for (const path of paths) {
+    if (isPathSyncable(path)) {
+      willSync.push(path);
+    } else {
+      excluded.push(path);
+    }
+  }
+  return { willSync, excluded };
+}
+
+class PatternPreviewModal extends Modal {
+  constructor(
+    app: App,
+    private willSync: string[],
+    private excluded: string[],
+  ) {
+    super(app);
+  }
+
+  onOpen(): void {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h2", { text: "Pattern preview" });
+
+    contentEl.createEl("h3", { text: `Will sync (${this.willSync.length})` });
+    const willSyncList = contentEl.createEl("ul");
+    (this.willSync.length ? this.willSync : ["None"]).forEach((path) =>
+      willSyncList.createEl("li", { text: path }),
+    );
+
+    contentEl.createEl("h3", {
+      text: `Excluded by pattern (${this.excluded.length})`,
+    });
+    const excludedList = contentEl.createEl("ul");
+    (this.excluded.length ? this.excluded : ["None"]).forEach((path) =>
+      excludedList.createEl("li", { text: path }),
+    );
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+  }
+}
+
 export default class GitHubSyncSettingsTab extends PluginSettingTab {
   plugin: GitHubSyncPlugin;
   private metadataCleanupTimer: number | undefined;
@@ -37,42 +91,36 @@ export default class GitHubSyncSettingsTab extends PluginSettingTab {
   }
 
   /**
-   * Renders a dynamic list of glob pattern rows: typing into the last (blank)
-   * row appends a new blank row below it, and every non-last row gets a
-   * delete button. Shared by the Sync Exclusions and Sync Inclusions lists.
+   * Renders a dynamic list of glob pattern rows plus a trailing "+ Add
+   * pattern" button. Typing in a row never rebuilds the settings tab (only
+   * saves + debounces metadata cleanup) so it never steals focus; growing or
+   * shrinking the list (button click / row delete) does rebuild, since
+   * there's nothing being typed into at that moment. Shared by the Sync
+   * Exclusions and Sync Inclusions lists.
    */
   private renderPatternList(
     containerEl: HTMLElement,
     patterns: string[],
     placeholder: string,
   ) {
-    if (patterns.length === 0 || patterns[patterns.length - 1].trim() !== "") {
-      patterns.push("");
-    }
-
     const onPatternDeleted = async () => {
       await this.plugin.saveSettings();
       await this.plugin.syncManager.removeExcludedFromMetadata();
     };
 
     patterns.forEach((pattern, index) => {
-      const isLastRow = index === patterns.length - 1;
-      const row = new Setting(containerEl).addText((text) =>
-        text
-          .setPlaceholder(placeholder)
-          .setValue(pattern)
-          .onChange(async (value) => {
-            patterns[index] = value;
-            await this.plugin.saveSettings();
-            this.scheduleMetadataCleanup();
-            if (isLastRow && value.trim() !== "") {
-              this.display();
-            }
-          }),
-      );
-
-      if (!isLastRow) {
-        row.addButton((button) =>
+      new Setting(containerEl)
+        .addText((text) =>
+          text
+            .setPlaceholder(placeholder)
+            .setValue(pattern)
+            .onChange(async (value) => {
+              patterns[index] = value;
+              await this.plugin.saveSettings();
+              this.scheduleMetadataCleanup();
+            }),
+        )
+        .addButton((button) =>
           button
             .setIcon("trash")
             .setTooltip("Remove")
@@ -82,8 +130,45 @@ export default class GitHubSyncSettingsTab extends PluginSettingTab {
               this.display();
             }),
         );
-      }
     });
+
+    new Setting(containerEl).addButton((button) =>
+      button.setButtonText("+ Add pattern").onClick(() => {
+        patterns.push("");
+        this.display();
+      }),
+    );
+  }
+
+  /**
+   * Recursively walks the vault root and returns every file path -- same
+   * stack-based walk shape as SyncManager.reconcileConfigDirFiles(), just
+   * starting from the vault root instead of configDir.
+   */
+  private async collectVaultPaths(): Promise<string[]> {
+    const vault = this.app.vault;
+    const paths: string[] = [];
+    const folders = [vault.getRoot().path];
+    while (folders.length > 0) {
+      const folder = folders.pop();
+      if (!folder) continue;
+      const res = await vault.adapter.list(folder);
+      paths.push(...res.files);
+      folders.push(...res.folders);
+    }
+    return paths;
+  }
+
+  /**
+   * Local-only preview: no GitHub call, just the vault walk + current
+   * exclude/include patterns via SyncManager.isPathSyncable().
+   */
+  private async showPatternPreview(): Promise<void> {
+    const paths = await this.collectVaultPaths();
+    const { willSync, excluded } = bucketPathsByPattern(paths, (path) =>
+      this.plugin.syncManager.isPathSyncable(path),
+    );
+    new PatternPreviewModal(this.app, willSync, excluded).open();
   }
 
   display(): void {
@@ -278,6 +363,15 @@ export default class GitHubSyncSettingsTab extends PluginSettingTab {
       this.plugin.settings.includePatterns,
       "e.g. gitless/**/main.js",
     );
+
+    new Setting(containerEl)
+      .setName("Preview pattern matches")
+      .setDesc(
+        "Shows which vault files will sync vs. be excluded under your current patterns. Local check only, no GitHub call.",
+      )
+      .addButton((button) =>
+        button.setButtonText("Preview").onClick(() => this.showPatternPreview()),
+      );
 
     new Setting(containerEl).setName("Device Specific").setHeading();
 

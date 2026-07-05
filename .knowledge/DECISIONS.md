@@ -1,7 +1,27 @@
 ---
-updated: "2026-07-04"
+updated: "2026-07-05"
 ---
 # Decisions
+
+## 2026-07-05 — Fix Preview Accuracy (syncConfigDir) + Surface Remote-Delete Count
+**Chose:** new `isPathSyncable()` method (layers `syncConfigDir` gate + dot-file skip on top of `shouldSkipFile()`) for the Preview button's accuracy fix; post-sync Notice count for the delete-visibility mitigation, for `sync`. **Over:** inlining the checks in `tab.ts` (duplicates logic across call sites); fixing `syncConfigDir` only and skipping dot-files (partial fix for no real savings); log-line-only visibility (still requires opening logs to notice); pre-sync confirmation modal (disproportionate — Gate G established the risk is git-history-recoverable, not permanent).
+**Why:** QA sweep on `plan-pattern-settings-ux-and-remote-cleanup.md` found 1 major (Preview misreports `.obsidian/*` files when `syncConfigDir` is off, the default) + 1 blocker (delete-on-exclude had no visible confirmation beyond a generic debug log) — human chose `act-on-critique`, then on Gate G reframe accepted a proportionate fix over heavier options.
+**Plan:** ./features/sync/plans/plan-fix-preview-accuracy-and-delete-visibility.md
+
+## 2026-07-05 — Pattern Settings UX Fix + Remote-Orphan Cleanup + Local Diff Preview
+**Chose:** (1) explicit "+ Add pattern" button, remove `display()`-on-keystroke; (2) delete-from-remote fires on the *next* regular `sync()` via existing `delete_remote` pipeline, not immediately from settings; (3) local-only pattern-preview modal (no GitHub call), for `sync`. **Over:** (1) targeted DOM insert (fights Setting builder, no clean API); (2) immediate remote delete from settings (breaks "remote changes only via explicit Sync" contract) and a manual cleanup button (duplicates what next-sync already covers); (3) remote-aware preview button (adds API dependency to answer what item 2 already resolves) and live per-row match-count (previously rejected for perf reasons in `plan-fix-exclude-patterns-qa-findings.md`).
+**Why:** Item 2 reverses `plan-exclude-patterns.md`'s original "exclude never touches remote" decision because real usage showed it surprising; reusing the existing tested `delete_remote` pipeline avoids a new remote-write path entirely.
+**Plan:** ./features/sync/plans/plan-pattern-settings-ux-and-remote-cleanup.md
+
+## 2026-07-05 — Harden Exclude-Patterns Against Remaining Minor QA Findings (Option C: split treatment)
+**Chose:** Silent internal pattern-length cap in `matchesAny()` (same class as existing blank/malformed handling, no UI) + fully closing the residual sync race via a tracked `pendingMetadataCleanup` promise that `sync()`/`firstSync()` await, for `sync`. **Over:** minimal (same cap, but race fix only narrows via a second `syncing` re-check, doesn't close it), full UX treatment (surfaces the length cap in settings UI — reopens the UI-validation scope-creep concern the original build's Option C already rejected).
+**Why:** Full race closure costs about the same code as narrowing it, so no reason to settle for narrower. UI validation is a product decision (threshold, message, hard-block vs warn) that doesn't belong in a reactive hardening pass.
+**Plan:** ./features/sync/plans/plan-harden-exclude-patterns.md
+
+## 2026-07-05 — Fix Exclude-Patterns QA Blockers (Option B: blockers + causally-linked majors)
+**Chose:** Fix both confirmed blockers (ReDoS in glob matcher → linear-time non-backtracking matcher; manifest deletion in `removeExcludedFromMetadata` → route through `shouldSkipFile`) plus 2 causally-linked perf majors (`this.syncing` race guard, debounce per-keystroke reconciliation), for `sync`. **Over:** blockers-only (defers fixes to files already being reopened — wasteful sequencing), full 21-finding sweep (bundles UX/design decisions into a bugfix pass; "live match-count" idea would introduce a new perf concern).
+**Why:** Both blockers were independently confirmed via live reproduction during QA (4.2s ReDoS hang, verified manifest-path match). The 2 majors touch the same files/methods already being fixed — bundling avoids reopening them twice. UX/a11y findings deferred to their own pass.
+**Plan:** ./features/sync/plans/plan-fix-exclude-patterns-qa-findings.md
 
 ## 2026-07-04 — Exclude Files/Folders From Sync by Pattern
 **Chose:** Gitignore-style glob (`*`, `**`, trailing `/`) across two separate settings arrays — `excludePatterns` + `includePatterns` (include always wins) — matched via one centralized pure function (`isExcludedPath`), reused at all 9 existing filter call-sites, for `sync`. **Over:** simple wildcard-only glob (imprecise), raw JS regex per row (wrong audience), single ordered list with `!`-prefix negation (order-dependent, harder to explain in UI than two plain lists).

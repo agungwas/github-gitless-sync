@@ -457,10 +457,14 @@ export default class SyncManager {
       await this.pendingMetadataCleanup;
     }
     try {
-      await this.syncImpl();
+      const removedFromRemoteCount = await this.syncImpl();
       // Shown only if sync doesn't fail
       await this.logger.info("Sync successful");
-      new Notice("Sync successful", 5000);
+      const successMessage =
+        removedFromRemoteCount > 0
+          ? `Sync successful (${removedFromRemoteCount} removed from remote due to exclude patterns)`
+          : "Sync successful";
+      new Notice(successMessage, 5000);
     } catch (err) {
       await this.logger.error("Error syncing", { error: err instanceof Error ? err.message : String(err) });
       // Show the error to the user, it's not automatically dismissed to make sure
@@ -471,7 +475,7 @@ export default class SyncManager {
     notice.hide();
   }
 
-  private async syncImpl() {
+  private async syncImpl(): Promise<number> {
     await this.logger.info("Starting sync");
     await this.reconcileConfigDirFiles();
     const { files, sha: treeSha } = await this.client.getRepoContent({
@@ -552,6 +556,7 @@ export default class SyncManager {
       }
     }
 
+    const excludedRemoteOrphans = this.computeExcludedRemoteOrphans(files);
     const actions: SyncAction[] = [
       ...(await this.determineSyncActions(
         remoteMetadata.files,
@@ -559,12 +564,13 @@ export default class SyncManager {
         conflictActions.map((action) => action.filePath),
       )),
       ...conflictActions,
+      ...excludedRemoteOrphans,
     ];
 
     if (actions.length === 0) {
       // Nothing to sync
       await this.logger.info("Nothing to sync");
-      return;
+      return 0;
     }
     await this.logger.info("Actions to sync", actions);
 
@@ -667,6 +673,7 @@ export default class SyncManager {
     ]);
 
     await this.commitSync(newTreeFiles, treeSha, conflictResolutions);
+    return excludedRemoteOrphans.length;
   }
 
   private isInternalSyncFile(filePath: string): boolean {
@@ -688,7 +695,7 @@ export default class SyncManager {
     );
   }
 
-  private shouldSkipFile(filePath: string): boolean {
+  shouldSkipFile(filePath: string): boolean {
     if (filePath === `${this.vault.configDir}/${MANIFEST_FILE_NAME}`) {
       // The manifest must never be treated as excluded, even if a user
       // pattern would otherwise match it.
@@ -698,6 +705,47 @@ export default class SyncManager {
       this.isVolatileSyncArtifact(filePath) ||
       isExcludedPath(filePath, this.settings.excludePatterns, this.settings.includePatterns)
     );
+  }
+
+  /**
+   * Whether filePath is actually synced under current settings -- shouldSkipFile()
+   * plus the syncConfigDir gate and the configDir dot-file skip that live
+   * separately in determineSyncActions() and reconcileConfigDirFiles(). Single
+   * choke point for "will this file really sync", used by the settings-tab preview.
+   */
+  isPathSyncable(filePath: string): boolean {
+    if (filePath === `${this.vault.configDir}/${MANIFEST_FILE_NAME}`) {
+      return true;
+    }
+    if (this.shouldSkipFile(filePath)) {
+      return false;
+    }
+    if (!this.settings.syncConfigDir && filePath.startsWith(this.vault.configDir)) {
+      return false;
+    }
+    if (
+      filePath.startsWith(`${this.vault.configDir}/`) &&
+      filePath.split("/").last()?.startsWith(".")
+    ) {
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Finds paths that now match an exclude pattern but are still present in the
+   * raw remote git tree from a time before the pattern was added -- these were
+   * dropped from local+remote metadata by removeExcludedFromMetadata(), which
+   * never touches the remote repo itself. Returns one delete_remote action per
+   * orphan so the next commit actually removes the blob from GitHub.
+   */
+  private computeExcludedRemoteOrphans(files: {
+    [key: string]: GetTreeResponseItem;
+  }): SyncAction[] {
+    return Object.keys(files)
+      .filter((filePath) => filePath !== `${this.vault.configDir}/${MANIFEST_FILE_NAME}`)
+      .filter((filePath) => this.shouldSkipFile(filePath))
+      .map((filePath) => ({ type: "delete_remote", filePath }));
   }
 
   private filterRemoteMetadataFiles(filesMetadata: {

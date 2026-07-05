@@ -426,6 +426,44 @@ describe('SyncManager - Filename Context in Filesystem Error Messages', () => {
     });
   });
 
+  describe('isPathSyncable (plan-fix-preview-accuracy-and-delete-visibility)', () => {
+    it('returns true for the manifest regardless of syncConfigDir', () => {
+      (syncManager as any).settings = { ...mockSettings, syncConfigDir: false, excludePatterns: [], includePatterns: [] };
+      const isPathSyncable = (syncManager as any).isPathSyncable.bind(syncManager);
+      expect(isPathSyncable('.obsidian/github-sync-metadata.json')).toBe(true);
+    });
+
+    it('returns false for a configDir file when syncConfigDir is false', () => {
+      (syncManager as any).settings = { ...mockSettings, syncConfigDir: false, excludePatterns: [], includePatterns: [] };
+      const isPathSyncable = (syncManager as any).isPathSyncable.bind(syncManager);
+      expect(isPathSyncable('.obsidian/plugins/foo/main.js')).toBe(false);
+    });
+
+    it('returns true for a non-dot-prefixed configDir file when syncConfigDir is true', () => {
+      (syncManager as any).settings = { ...mockSettings, syncConfigDir: true, excludePatterns: [], includePatterns: [] };
+      const isPathSyncable = (syncManager as any).isPathSyncable.bind(syncManager);
+      expect(isPathSyncable('.obsidian/plugins/foo/main.js')).toBe(true);
+    });
+
+    it('returns false for a dot-prefixed configDir file even when syncConfigDir is true', () => {
+      (syncManager as any).settings = { ...mockSettings, syncConfigDir: true, excludePatterns: [], includePatterns: [] };
+      const isPathSyncable = (syncManager as any).isPathSyncable.bind(syncManager);
+      expect(isPathSyncable('.obsidian/plugins/foo/.hidden')).toBe(false);
+    });
+
+    it('is unaffected by syncConfigDir for a non-configDir file', () => {
+      (syncManager as any).settings = { ...mockSettings, syncConfigDir: false, excludePatterns: [], includePatterns: [] };
+      const isPathSyncable = (syncManager as any).isPathSyncable.bind(syncManager);
+      expect(isPathSyncable('notes/todo.md')).toBe(true);
+    });
+
+    it('returns false for a path already excluded via patterns, regardless of syncConfigDir', () => {
+      (syncManager as any).settings = { ...mockSettings, syncConfigDir: true, excludePatterns: ['**/main.js'], includePatterns: [] };
+      const isPathSyncable = (syncManager as any).isPathSyncable.bind(syncManager);
+      expect(isPathSyncable('notes/main.js')).toBe(false);
+    });
+  });
+
   describe('filterRemoteMetadataFiles with exclude patterns (plan-exclude-patterns)', () => {
     it('strips a path matching an exclude pattern from remote metadata', () => {
       (syncManager as any).settings = { ...mockSettings, excludePatterns: ['**/main.js'], includePatterns: [] };
@@ -495,6 +533,59 @@ describe('SyncManager - Filename Context in Filesystem Error Messages', () => {
       const actions = await syncManager.determineSyncActions(remoteFiles as any, localFiles as any, []);
 
       expect(actions).toEqual([{ type: 'upload', filePath: 'notes/todo.md' }]);
+    });
+  });
+
+  describe('computeExcludedRemoteOrphans (plan-pattern-settings-ux-and-remote-cleanup)', () => {
+    it('emits a delete_remote action for an excluded path still present in the raw remote tree', () => {
+      (syncManager as any).settings = { ...mockSettings, excludePatterns: ['**/main.js'], includePatterns: [] };
+      const computeExcludedRemoteOrphans = (syncManager as any).computeExcludedRemoteOrphans.bind(syncManager);
+
+      const files = {
+        '.obsidian/plugins/foo/main.js': { path: '.obsidian/plugins/foo/main.js', sha: 'remote-sha' },
+        'notes/todo.md': { path: 'notes/todo.md', sha: 'other-sha' },
+      };
+
+      expect(computeExcludedRemoteOrphans(files)).toEqual([
+        { type: 'delete_remote', filePath: '.obsidian/plugins/foo/main.js' },
+      ]);
+    });
+
+    it('emits nothing for a pattern that matches no path currently in the remote tree', () => {
+      (syncManager as any).settings = { ...mockSettings, excludePatterns: ['**/main.js'], includePatterns: [] };
+      const computeExcludedRemoteOrphans = (syncManager as any).computeExcludedRemoteOrphans.bind(syncManager);
+
+      const files = {
+        'notes/todo.md': { path: 'notes/todo.md', sha: 'other-sha' },
+      };
+
+      expect(computeExcludedRemoteOrphans(files)).toEqual([]);
+    });
+
+    it('does not orphan a path matched by both exclude and include patterns (include wins)', () => {
+      (syncManager as any).settings = {
+        ...mockSettings,
+        excludePatterns: ['**/main.js'],
+        includePatterns: ['.obsidian/plugins/gitless/**/main.js'],
+      };
+      const computeExcludedRemoteOrphans = (syncManager as any).computeExcludedRemoteOrphans.bind(syncManager);
+
+      const files = {
+        '.obsidian/plugins/gitless/main.js': { path: '.obsidian/plugins/gitless/main.js', sha: 'remote-sha' },
+      };
+
+      expect(computeExcludedRemoteOrphans(files)).toEqual([]);
+    });
+
+    it('never orphans the manifest, even under a broad exclude pattern', () => {
+      (syncManager as any).settings = { ...mockSettings, excludePatterns: ['**/*.json'], includePatterns: [] };
+      const computeExcludedRemoteOrphans = (syncManager as any).computeExcludedRemoteOrphans.bind(syncManager);
+
+      const files = {
+        '.obsidian/github-sync-metadata.json': { path: '.obsidian/github-sync-metadata.json', sha: 'manifest-sha' },
+      };
+
+      expect(computeExcludedRemoteOrphans(files)).toEqual([]);
     });
   });
 
@@ -716,6 +807,27 @@ describe('SyncManager - Filename Context in Filesystem Error Messages', () => {
       await syncManager.removeExcludedFromMetadata();
 
       expect((syncManager as any).pendingMetadataCleanup).toBeNull();
+    });
+  });
+
+  describe('sync() success Notice with remote-delete count (plan-fix-preview-accuracy-and-delete-visibility)', () => {
+    it('shows the plain "Sync successful" Notice when syncImpl() reports 0 removed', async () => {
+      (syncManager as any).syncImpl = vi.fn().mockResolvedValue(0);
+
+      await syncManager.sync();
+
+      expect(Notice).toHaveBeenCalledWith('Sync successful', 5000);
+    });
+
+    it('appends the removed-from-remote count when syncImpl() reports a positive count', async () => {
+      (syncManager as any).syncImpl = vi.fn().mockResolvedValue(3);
+
+      await syncManager.sync();
+
+      expect(Notice).toHaveBeenCalledWith(
+        'Sync successful (3 removed from remote due to exclude patterns)',
+        5000,
+      );
     });
   });
 
