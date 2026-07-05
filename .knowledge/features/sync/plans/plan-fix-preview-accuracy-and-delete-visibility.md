@@ -1,5 +1,6 @@
 ---
-status: in-progress
+status: done
+completed: "2026-07-05"
 slug: fix-preview-accuracy-and-delete-visibility
 created: "2026-07-05"
 testing: tdd

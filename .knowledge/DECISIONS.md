@@ -3,6 +3,11 @@ updated: "2026-07-05"
 ---
 # Decisions
 
+## 2026-07-05 — Widen Remote-Orphan Cleanup to Cover syncConfigDir-Off Files
+**Chose:** swap `computeExcludedRemoteOrphans()`'s filter from `shouldSkipFile()` to `!isPathSyncable()` (strict widening — every prior case still caught), for `sync`. **Over:** duplicating the syncConfigDir/dot-file checks inline (same duplication problem already rejected once); widening `shouldSkipFile()` itself (risks double-negation at its other call sites, which have their own separate syncConfigDir checks).
+**Why:** QA on `plan-fix-preview-accuracy-and-delete-visibility.md` found turning `syncConfigDir` off orphans configDir files on GitHub forever — same bug class the pattern-exclude fix solved, unreached by it since `shouldSkipFile()` has no `syncConfigDir` awareness.
+**Plan:** ./features/sync/plans/plan-fix-syncconfigdir-remote-orphans.md
+
 ## 2026-07-05 — Fix Preview Accuracy (syncConfigDir) + Surface Remote-Delete Count
 **Chose:** new `isPathSyncable()` method (layers `syncConfigDir` gate + dot-file skip on top of `shouldSkipFile()`) for the Preview button's accuracy fix; post-sync Notice count for the delete-visibility mitigation, for `sync`. **Over:** inlining the checks in `tab.ts` (duplicates logic across call sites); fixing `syncConfigDir` only and skipping dot-files (partial fix for no real savings); log-line-only visibility (still requires opening logs to notice); pre-sync confirmation modal (disproportionate — Gate G established the risk is git-history-recoverable, not permanent).
 **Why:** QA sweep on `plan-pattern-settings-ux-and-remote-cleanup.md` found 1 major (Preview misreports `.obsidian/*` files when `syncConfigDir` is off, the default) + 1 blocker (delete-on-exclude had no visible confirmation beyond a generic debug log) — human chose `act-on-critique`, then on Gate G reframe accepted a proportionate fix over heavier options.

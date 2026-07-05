@@ -1,5 +1,6 @@
 ---
-status: in-progress
+status: done
+completed: "2026-07-05"
 slug: pattern-settings-ux-and-remote-cleanup
 created: "2026-07-05"
 testing: tdd

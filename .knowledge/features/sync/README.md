@@ -1,7 +1,7 @@
 ---
 last_updated: "2026-07-05"
-updated_by_plan: "plan-fix-events-listener-edge-cases.md"
-decision: "2026-06-18 — Fix EventsListener Edge Cases (QA follow-up)"
+updated_by_plan: "plan-fix-syncconfigdir-remote-orphans.md"
+decision: "2026-07-05 — Widen Remote-Orphan Cleanup to Cover syncConfigDir-Off Files"
 ---
 # Sync Feature
 
@@ -68,7 +68,7 @@ Guarded by `this.syncing` flag.
 Guarded by `this.syncing` flag. Shows Obsidian `Notice` during sync.
 
 ```
-syncImpl():
+syncImpl(): Promise<number>                    → count of exclude/syncConfigDir-driven remote deletes this run
   0. reconcileConfigDirFiles()                 → add untracked configDir files to metadata
   1. getRepoContent()                          → files (tree), treeSha
   2. fetch remote manifest blob                → remoteMetadata
@@ -78,10 +78,11 @@ syncImpl():
   5.5. migrateIllegalFilenames()               → migratedOldKeys (Set<string>)
   6. findConflicts()                           → ConflictFile[] (excluding migratedOldKeys)
   7. resolve conflicts (per conflictHandling setting)
-  8. determineSyncActions()                    → SyncAction[]
+  8. determineSyncActions() + computeExcludedRemoteOrphans() → SyncAction[] (the latter appends delete_remote for paths isPathSyncable() now says aren't synced but are still in the raw remote tree)
   9. apply upload/delete_remote to newTreeFiles dict
   10. parallel: download files + delete local files
   11. commitSync(newTreeFiles, treeSha, conflictResolutions)
+  12. return excludedRemoteOrphans.length        → sync() appends "(N removed from remote due to exclude patterns)" to the success Notice when > 0
 ```
 
 ### Conflict Detection (`findConflicts()`)
@@ -235,7 +236,7 @@ isExcludedPath = matchesAny(filePath, excludePatterns) && !matchesAny(filePath, 
 
 Include always wins regardless of list order or edit recency. Blank/whitespace entries and patterns over `MAX_PATTERN_LENGTH` (500 chars) are ignored, never treated as match-all. The glob matcher (`matchSegment` + `matchSegmentSequence` in `sync-filters.ts`) is a two-pointer/DP implementation, not backtracking regex — deliberately built this way to stay `O(n*m)` and immune to ReDoS on adversarial patterns.
 
-`shouldSkipFile(filePath)` in `sync-manager.ts:691` is the single choke point: manifest path is always exempt (checked first, before pattern matching), then `isVolatileSyncArtifact()` (log file, 2 workspace files), then `isExcludedPath()`. All 9 filtering call sites route through it:
+`shouldSkipFile(filePath)` in `sync-manager.ts:698` is the base choke point: manifest path is always exempt (checked first, before pattern matching), then `isVolatileSyncArtifact()` (log file, 2 workspace files), then `isExcludedPath()`. All 9 filtering call sites route through it:
 
 | Location | Function | What it filters |
 |---|---|---|
@@ -246,19 +247,27 @@ Include always wins regardless of list order or edit recency. Blank/whitespace e
 | `sync-manager.ts:758` / `reconcileConfigDirFiles()` | configDir walk — skips excluded/volatile + hidden (`.`-prefixed) files |
 | `sync-manager.ts:1189` (in `determineSyncActions()`) | inline filter | Drops sync actions for excluded paths |
 | `sync-manager.ts:1486`, `1539` | `loadMetadata()` / `addConfigDirToMetadata()` | Initial/toggle-enable scans skip excluded files |
-| `sync-manager.ts:1612` | `performExcludedMetadataCleanup()` (via `removeExcludedFromMetadata()`) | Settings-triggered reconciliation, see below |
+| `sync-manager.ts:1641` | `performExcludedMetadataCleanup()` (via `removeExcludedFromMetadata()`) | Settings-triggered reconciliation, see below |
 
-### Settings-triggered metadata cleanup (`removeExcludedFromMetadata`)
+### `isPathSyncable(filePath)` — the settings-toggle-aware superset (`sync-manager.ts:716`)
 
-Called from `src/settings/tab.ts` on every pattern-row edit/delete (debounced 400ms via `scheduleMetadataCleanup()` for typing; immediate on row delete). Guarded by `this.syncing` — skipped if a sync is already in flight; the in-flight promise is tracked in `pendingMetadataCleanup` so `sync()`/`firstSync()` can await it before proceeding (added 2026-07-05 hardening pass to close a metadata-mutation race).
+Added 2026-07-05 (`plan-fix-preview-accuracy-and-delete-visibility.md`). `shouldSkipFile()` alone doesn't know about the `syncConfigDir` toggle (gated separately at `determineSyncActions()`'s tail filter and `reconcileConfigDirFiles()`'s early return) or the configDir dot-file skip (`reconcileConfigDirFiles()`). `isPathSyncable()` layers both on top, in order: manifest always `true` → `shouldSkipFile()` → `syncConfigDir` gate (any configDir path is unsyncable when the toggle is off) → dot-prefixed-basename-under-configDir gate. It's a **strict widening** — every path `shouldSkipFile()` used to catch is still caught. Two consumers:
+- `src/settings/tab.ts`'s "Preview pattern matches" button (`showPatternPreview()`) — the accurate, local-only picture of what will/won't sync.
+- `sync-manager.ts:744`'s `computeExcludedRemoteOrphans()` (see below) — widened 2026-07-05 (`plan-fix-syncconfigdir-remote-orphans.md`) from `shouldSkipFile()` to `!isPathSyncable()`, so it also catches files orphaned by turning `syncConfigDir` off, not just pattern-excluded ones.
 
-`performExcludedMetadataCleanup()` deletes any `metadataStore.data.files` entry whose path (or `localPath` if the file was sanitized for illegal chars) now matches `shouldSkipFile()`. **This only removes the local tracking entry — it never touches the physical local file, and it never issues a remote delete.** Confirmed as intended design in `plan-exclude-patterns.md` Edge Cases table: "Pattern added that matches an already-tracked file → File dropped from local+remote metadata via `removeExcludedFromMetadata()` on next settings change; physical local file untouched."
+### Settings-triggered metadata cleanup (`removeExcludedFromMetadata`) + remote-orphan cleanup (`computeExcludedRemoteOrphans`)
 
-**Net effect on a file already synced to GitHub before being excluded:** on the next regular sync, `filterRemoteMetadataFiles()` strips the file from `remoteMetadata.files` and the local cleanup above strips it from `metadataStore.data.files`. With no metadata entry on either side, `determineSyncActions()` (`sync-manager.ts:1068`) never emits an action for that path — no upload, download, or `delete_remote`. Meanwhile `newTreeFiles` (`sync-manager.ts:571`) is seeded from the **raw, unfiltered** GitHub tree returned by `getRepoContent()`, so the file's existing blob entry is carried into every subsequent commit unchanged. **The file is never removed from the remote repo by excluding it** — exclusion only stops future sync consideration of the path; a file already on GitHub before the pattern was added stays there indefinitely.
+`removeExcludedFromMetadata()` is called from `src/settings/tab.ts` on every pattern-row edit/delete (debounced 400ms via `scheduleMetadataCleanup()` for typing; immediate on row delete). Guarded by `this.syncing` — skipped if a sync is already in flight; the in-flight promise is tracked in `pendingMetadataCleanup` so `sync()`/`firstSync()` can await it before proceeding. `removeConfigDirFromMetadata()` (called when the `syncConfigDir` toggle is switched off) is the same shape, for configDir files.
+
+`performExcludedMetadataCleanup()` deletes any `metadataStore.data.files` entry whose path (or `localPath` if the file was sanitized for illegal chars) now matches `shouldSkipFile()`. **This only removes the local tracking entry — it never touches the physical local file.** This part of the design is unchanged and intentional (`plan-exclude-patterns.md` Edge Cases table).
+
+**What changed 2026-07-05 (`plan-pattern-settings-ux-and-remote-cleanup.md`, widened by `plan-fix-syncconfigdir-remote-orphans.md`):** previously, a file already synced to GitHub before being excluded (or before `syncConfigDir` was turned off) stayed on the remote repo forever — `filterRemoteMetadataFiles()`/local cleanup stripped it from both metadata sides, `determineSyncActions()` never saw it, and `newTreeFiles` (seeded from the **raw, unfiltered** GitHub tree) carried its blob into every subsequent commit unchanged. `computeExcludedRemoteOrphans()` (`sync-manager.ts:744`) now closes this: inside `syncImpl()`, it scans the raw remote tree for any path (except the manifest) where `!isPathSyncable(path)` is true, and emits a `delete_remote` action for each — reusing the existing `delete_remote` pipeline, so the file is actually removed from GitHub on the **next regular sync** (not immediately when the setting changes). `sync()`'s "Sync successful" Notice appends `" (N removed from remote due to exclude patterns)"` when `N > 0` (`sync-manager.ts:446`).
 
 ### Settings UI mechanics (`src/settings/tab.ts`, `renderPatternList()`)
 
-Exclude/include lists are each rendered as N rows + one trailing always-blank row. Every keystroke in any row calls `this.plugin.saveSettings()` immediately, then `scheduleMetadataCleanup()` (debounced). If the edited row is the trailing blank row and its new value is non-blank, `renderPatternList` additionally calls `this.display()` synchronously on that same keystroke — `display()` does `containerEl.empty()` then rebuilds the entire settings tab DOM from scratch (all sections, not just the pattern lists), which drops focus from whatever input the user was typing into (confirmed behavior, no `+`/add-row button exists — new-row growth is implicit-on-type only).
+Exclude/include lists are each rendered as N rows, each with its own delete (trash) button, plus a trailing **"+ Add pattern"** button (added 2026-07-05, `plan-pattern-settings-ux-and-remote-cleanup.md`). Every keystroke in any row calls `this.plugin.saveSettings()` immediately, then `scheduleMetadataCleanup()` (debounced) — typing never rebuilds the settings tab or steals focus. Clicking "+ Add pattern" pushes one blank row and calls `this.display()` (a full `containerEl.empty()` + rebuild) — safe since it's an explicit click, not a keystroke. There are two independent buttons, one per list (Exclusions, Inclusions).
+
+A **"Preview pattern matches"** button (same date) triggers `showPatternPreview()`: walks the vault root via `collectVaultPaths()` (same recursive `vault.adapter.list()` stack-walk shape as `reconcileConfigDirFiles()`), buckets every path via the pure function `bucketPathsByPattern(paths, isPathSyncable)` in `tab.ts:19`, and opens a `PatternPreviewModal` (`tab.ts:35`) listing "Will sync" / "Excluded by pattern". Local-only — no GitHub API call.
 
 ## Known Gaps / TODOs in Code
 
@@ -268,6 +277,9 @@ Exclude/include lists are each rendered as N rows + one trailing always-blank ro
 - `determineSyncActions`: TODO in remote-deleted/local-missing case about removing remote reference
 - `isSyncable()` in `EventsListener` has an edge case: all non-configDir files pass even if outside vault root (not reachable in practice via Obsidian events)
 - `reconcileConfigDirFiles()` not called in `firstSyncImpl()` path — if user installs plugin after startup but before first sync, `firstSyncFromLocal()` may miss those files (rare; files installed before startup are caught by `loadMetadata()` at startup)
+- `PatternPreviewModal.onOpen()` (the rendered "Will sync"/"Excluded" list markup in the Preview modal) has no test coverage — verified via typecheck + production build only, same class of Obsidian-DOM gap as `tab.ts`'s `display()`. The logic feeding it (`bucketPathsByPattern()`, `collectVaultPaths()`) is unit-tested; only the leaf-level rendering isn't.
+- `computeExcludedRemoteOrphans()`'s `delete_remote` actions are tested at the point they're produced, not through a full `syncImpl()` integration test — `syncImpl()` itself has no direct test anywhere in this codebase (pre-existing, every sub-piece is tested the same way at its own output boundary).
+- Testing `tab.ts`'s `Setting`-heavy methods (`renderPatternList()`, `showPatternPreview()`) requires a local `vi.mock("obsidian", ...)` override inside `tab.test.ts` providing minimal `Setting`/`PluginSettingTab`/`Modal` fakes — the shared `vitest.setup.ts` mock doesn't export `Setting` at all. Any future test touching these methods needs the same local mock pattern (see `tab.test.ts` top of file).
 
 ## Update 2026-07-04
 
@@ -279,10 +291,10 @@ Exclude/include lists are each rendered as N rows + one trailing always-blank ro
 | `main.ts:188` | `"Syncing..."` | first-sync path only, before `firstSync()` starts |
 | `main.ts:194` | `"Sync successful"` (5000ms) | first-sync path only, after `firstSync()` resolves without throwing |
 | `main.ts:198` | `"Error syncing. {err}"` | first-sync path only, `firstSync()` threw |
-| `sync-manager.ts:437` | `"Sync already in progress"` | regular sync, `this.syncing` already true — aborts early, no success/error notice follows |
-| `sync-manager.ts:442` | `"Syncing..."` | regular sync path, before `syncImpl()` starts |
-| `sync-manager.ts:448` | `"Sync successful"` (5000ms) | regular sync path, `syncImpl()` resolved without throwing |
-| `sync-manager.ts:453` | `"Error syncing. {err}"` | regular sync path, `syncImpl()` threw |
+| `sync-manager.ts:449` | `"Sync already in progress"` | regular sync, `this.syncing` already true — aborts early, no success/error notice follows |
+| `sync-manager.ts:454` | `"Syncing..."` | regular sync path, before `syncImpl()` starts |
+| `sync-manager.ts:463` | `"Sync successful"`, or `"Sync successful (N removed from remote due to exclude patterns)"` if `syncImpl()` returned `N > 0` (5000ms) | regular sync path, `syncImpl()` resolved without throwing — added 2026-07-05, `plan-fix-preview-accuracy-and-delete-visibility.md` |
+| `sync-manager.ts:472` | `"Error syncing. {err}"` | regular sync path, `syncImpl()` threw |
 
 No `Notice()` call in this codebase carries an icon, emoji, or checkmark prefix — every message above is plain text. There is no settings toggle that mutes/enables notices, and no per-device difference in this logic; `main.ts:167` (`sync()`) is the single entrypoint used by ribbon click, interval timer, window-focus, and window-blur triggers alike (`main.ts:148,154,160,162`).
 
