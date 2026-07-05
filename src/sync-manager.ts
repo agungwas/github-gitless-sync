@@ -733,18 +733,20 @@ export default class SyncManager {
   }
 
   /**
-   * Finds paths that now match an exclude pattern but are still present in the
-   * raw remote git tree from a time before the pattern was added -- these were
-   * dropped from local+remote metadata by removeExcludedFromMetadata(), which
-   * never touches the remote repo itself. Returns one delete_remote action per
-   * orphan so the next commit actually removes the blob from GitHub.
+   * Finds paths that are no longer synced under current settings but are still
+   * present in the raw remote git tree from before that stopped being true --
+   * an exclude pattern added after the file was already tracked, or syncConfigDir
+   * turned off, or a dot-prefixed configDir file. These were dropped from
+   * local+remote metadata by removeExcludedFromMetadata()/removeConfigDirFromMetadata(),
+   * which never touch the remote repo itself. Returns one delete_remote action
+   * per orphan so the next commit actually removes the blob from GitHub.
    */
   private computeExcludedRemoteOrphans(files: {
     [key: string]: GetTreeResponseItem;
   }): SyncAction[] {
     return Object.keys(files)
       .filter((filePath) => filePath !== `${this.vault.configDir}/${MANIFEST_FILE_NAME}`)
-      .filter((filePath) => this.shouldSkipFile(filePath))
+      .filter((filePath) => !this.isPathSyncable(filePath))
       .map((filePath) => ({ type: "delete_remote", filePath }));
   }
 

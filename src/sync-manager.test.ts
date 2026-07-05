@@ -562,9 +562,10 @@ describe('SyncManager - Filename Context in Filesystem Error Messages', () => {
       expect(computeExcludedRemoteOrphans(files)).toEqual([]);
     });
 
-    it('does not orphan a path matched by both exclude and include patterns (include wins)', () => {
+    it('does not orphan a path matched by both exclude and include patterns (include wins), with syncConfigDir on to isolate pattern precedence from the syncConfigDir gate', () => {
       (syncManager as any).settings = {
         ...mockSettings,
+        syncConfigDir: true,
         excludePatterns: ['**/main.js'],
         includePatterns: ['.obsidian/plugins/gitless/**/main.js'],
       };
@@ -586,6 +587,43 @@ describe('SyncManager - Filename Context in Filesystem Error Messages', () => {
       };
 
       expect(computeExcludedRemoteOrphans(files)).toEqual([]);
+    });
+
+    it('orphans a configDir file with no matching pattern once syncConfigDir is off (plan-fix-syncconfigdir-remote-orphans)', () => {
+      (syncManager as any).settings = { ...mockSettings, syncConfigDir: false, excludePatterns: [], includePatterns: [] };
+      const computeExcludedRemoteOrphans = (syncManager as any).computeExcludedRemoteOrphans.bind(syncManager);
+
+      const files = {
+        '.obsidian/plugins/foo/main.js': { path: '.obsidian/plugins/foo/main.js', sha: 'remote-sha' },
+      };
+
+      expect(computeExcludedRemoteOrphans(files)).toEqual([
+        { type: 'delete_remote', filePath: '.obsidian/plugins/foo/main.js' },
+      ]);
+    });
+
+    it('does not orphan a non-dot configDir file when syncConfigDir is on and no pattern matches', () => {
+      (syncManager as any).settings = { ...mockSettings, syncConfigDir: true, excludePatterns: [], includePatterns: [] };
+      const computeExcludedRemoteOrphans = (syncManager as any).computeExcludedRemoteOrphans.bind(syncManager);
+
+      const files = {
+        '.obsidian/plugins/foo/main.js': { path: '.obsidian/plugins/foo/main.js', sha: 'remote-sha' },
+      };
+
+      expect(computeExcludedRemoteOrphans(files)).toEqual([]);
+    });
+
+    it('orphans a dot-prefixed configDir file even when syncConfigDir is on', () => {
+      (syncManager as any).settings = { ...mockSettings, syncConfigDir: true, excludePatterns: [], includePatterns: [] };
+      const computeExcludedRemoteOrphans = (syncManager as any).computeExcludedRemoteOrphans.bind(syncManager);
+
+      const files = {
+        '.obsidian/plugins/foo/.hidden': { path: '.obsidian/plugins/foo/.hidden', sha: 'remote-sha' },
+      };
+
+      expect(computeExcludedRemoteOrphans(files)).toEqual([
+        { type: 'delete_remote', filePath: '.obsidian/plugins/foo/.hidden' },
+      ]);
     });
   });
 
