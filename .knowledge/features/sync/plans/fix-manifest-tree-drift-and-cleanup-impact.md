@@ -1,0 +1,55 @@
+---
+type: analysis-only
+status: draft
+slug: fix-manifest-tree-drift-and-cleanup
+feature: sync
+created: "2026-07-07"
+---
+
+# Impact Analysis: Fix Manifest/Tree Drift Crash + Converge Stuck Remote Entry
+
+## Goal
+
+Close the crash discovered in `iris-0a-explore` (2026-07-06, `Operasi.md`): `syncImpl()` throws
+`"Cannot read properties of undefined (reading 'path')"` when a `download` action's `filePath`
+is present in the remote manifest (non-deleted) but absent from the raw GitHub tree fetched by
+`getRepoContent()`. Scope of this change (per human selection):
+
+1. Guard the crash site so a missing tree entry for a `download` action does not abort the whole sync.
+2. Prevent `commitSync()` from ever re-introducing this drift — every non-deleted entry serialized
+   into the manifest must correspond to an actual item in the tree being committed.
+3. Converge the specific stuck remote-manifest entry for `Operasi.md` (currently baked into the repo's
+   HEAD commit) so no device keeps regenerating this crash on every sync attempt.
+
+No implementation approach is prescribed here — see `Impact Analysis` for what each candidate
+touch point affects.
+
+## Impact Analysis
+
+| Area | File / Location | What Changes | Risk & Justification |
+|---|---|---|---|
+| Download crash site | `sync-manager.ts:662-667` (`Promise.all` download branch inside `syncImpl()`) | Must stop unconditionally passing `files[action.filePath]` into `downloadFile()` when that lookup is `undefined` | **Low** — this `Promise.all` branch has no existing test coverage (`syncImpl()` itself is untested anywhere in this codebase, confirmed via `sync-manager.test.ts` — only `downloadFile()` is tested directly with a always-defined `mockFile`), so a guard here cannot regress an existing assertion, but it also means the fix ships with zero regression-test safety net unless new tests are added. |
+| `downloadFile()` signature/contract | `sync-manager.ts:1460-1461` | If the guard is placed inside `downloadFile()` instead of the call site, its signature (`file: GetTreeResponseItem`) would need to accept `undefined` or the call site must never pass it — either way the two existing tests (`sync-manager.test.ts:155,164`, both call `downloadFile(mockFile, ...)` with a defined file) are unaffected since they never exercise the undefined path. | **Low** — additive guard, no existing assertion touches this path. |
+| `commitSync()` manifest write | `sync-manager.ts:1403-1406` (`treeFiles[manifest].content = JSON.stringify(this.metadataStore.data)`) | Any invariant check added here ("every non-deleted local-metadata entry must have a `treeFiles` counterpart") runs against **all three callers**: `firstSyncFromRemote()` (`sync-manager.ts:370`), `firstSyncFromLocal()` (`sync-manager.ts:439`), and `syncImpl()` (`sync-manager.ts:675`) — it is not scoped to regular sync alone. | **Medium** — `firstSyncFromLocal()` already builds `newTreeFiles`/`treeFiles` by enumerating **every** non-deleted entry in `metadataStore.data.files` (`sync-manager.ts:400-437`), so it can never trip a "missing tree entry" check by construction; `syncImpl()` builds `newTreeFiles` from the old base tree plus only the actions `determineSyncActions()` selected (`sync-manager.ts:577-656`), so it is the only caller where the invariant can legitimately fail today. A check with the wrong scope/timing will false-positive on the two first-sync callers or on in-flight entries described in the next row. |
+| `migrateIllegalFilenames()` in-flight entries | `sync-manager.ts:1002-1008` | Creates a **new** local-metadata key with `sha: null, dirty: true` mid-`syncImpl()`, before `determineSyncActions()` runs (called at `sync-manager.ts:509`, before `determineSyncActions()` at `sync-manager.ts:561`). This key is local-only at creation time and is expected to receive an `upload` action in the **same** sync run ("file in local only" branch, `sync-manager.ts:1217-1232`), which then populates `treeFiles` in the upload-processing `Promise.all` (`sync-manager.ts:594-656`) before `commitSync()` is reached at line 675. | **Medium** — any manifest-integrity check must run *after* the upload/download Promise.all blocks (i.e., where `commitSync()` already is), not earlier, or it will flag a legitimate in-flight migration entry as drift. It also means such entries are **shape-identical** to the bug's phantom entries (`sha: null`, not deleted, no tree presence) at every point before the upload actually completes — a check can't distinguish "about to be uploaded this run" from "orphaned forever" by inspecting `sha` alone; it must check final `treeFiles` state, not intermediate metadata state. |
+| Upload-skip precedent (existing pattern) | `sync-manager.ts:599-617` ("file no longer exists, treating as delete_remote") | This is the only existing precedent in the codebase for "an action's target vanished mid-sync, convert to a deletion instead of crashing." Relevant to compare against for the download-side fix, since it already updates `this.metadataStore.data.files[...]` in place so the *next* `commitSync()` serializes a corrected manifest. | **Low** — informational; no direct code touched by that line changes as part of this analysis, but any download-side fix following this shape inherits the same "corrects itself on next successful commit" property, which is what closes risk item 3 (stuck remote entry) — see Edge Cases. |
+| `reconcileRemoteMetadataWithTree()` | `sync-manager.ts:845-876` | Currently `return`s silently when `remoteRepoFiles[filePath]` is `undefined` (line 861) — the drift is never surfaced before `determineSyncActions()` blindly trusts the manifest. Read-only/reconciliation function; whether it needs to change depends on whether the chosen fix wants to catch drift here (earlier) vs. only at the download call site (later). | **Low** — no existing test asserts its current silent-skip behavior (`sync-manager.test.ts` has no `describe('reconcileRemoteMetadataWithTree')` block), so changing it cannot break an existing assertion, but also means no regression coverage exists today. |
+| Convergence of the live stuck entry (`Operasi.md`) | Remote `github-sync-metadata.json` blob in the repo's current HEAD commit (not a local file) | Not fixable by editing any device's local state — the phantom entry lives in the manifest blob committed to GitHub. It is only corrected when some device, running the fixed code, completes a **full sync cycle through `commitSync()`** (guard survives the download step → reaches `commitSync()` → serializes a manifest with the entry marked `deleted` or removed). | **Medium** — until one device runs the fix and completes a sync, every device (including devices not yet updated) will keep crashing on every sync attempt against the current remote state; this is an external-state dependency, not just a code change. |
+| Status bar indicator | `src/main.ts` (status bar reads `metadataStore.data.files[activeFilePath].dirty`, per `.knowledge/features/status-bar-indicator/README.md`) | Unaffected. A phantom remote-only entry has, by definition, no corresponding local file being viewed/edited (it was never downloaded), so the status bar's per-active-file lookup never resolves to it. | **None** — traced the specific field it reads (`dirty`) and confirmed no phantom entry can be the active file. |
+| Conflict Resolution view | `src/views/conflicts-resolution/*`, `sync-manager.ts` `onConflicts` callback | Unaffected. `findConflicts()` only evaluates `commonFiles` (present in both remote and local metadata, `sync-manager.ts:1037`); a remote-only phantom entry never enters conflict detection. | **None** — traced `findConflicts()`'s input set directly. |
+
+## Cross-Feature Risks
+
+- **`file-validation` feature (`migrateIllegalFilenames()`, `sync-manager.ts:949-1021`)**: shares the exact entry shape (`sha: null`, non-deleted, no tree presence at intermediate points) with the bug being fixed. A manifest-integrity guard implemented with the wrong timing (checked before the upload Promise.all resolves, or checked by inspecting `sha === null` as the drift signal) will misfire on legitimate mid-migration entries and break filename migration, not just the crash bug. This is the single most concrete collision — named function, named lines, named data shape.
+- **`status-bar-indicator`** and **`conflict-resolution`**: checked directly against their specific read paths (`dirty` field lookup; `findConflicts()`'s `commonFiles` computation) — neither can observe a remote-only phantom entry, so both are unaffected. No hedging: this is a definite non-risk, not a "probably fine."
+
+## Edge Cases
+
+- **Multiple phantom entries in one sync**: the download loop (`sync-manager.ts:660-667`) runs all `download` actions concurrently in one `Promise.all`; `Promise.all` rejects on the *first* failure, so if 2+ phantom entries exist, only one error surfaces per attempt and any legitimate downloads still in flight in that same batch are abandoned (their resolution is discarded, not persisted) even though they'd have succeeded. Whatever fix is chosen must handle N phantom entries in a single pass, not just the first.
+- **`sha: null` ambiguity**: a manifest entry with `sha: null` cannot alone distinguish "in-flight migration entry about to be uploaded this run" (legitimate, see `migrateIllegalFilenames()` row above) from "orphaned phantom that will never get a tree entry" (the bug) — both are `sha: null`, non-deleted, at the point `determineSyncActions()` runs. Any fix must key off `treeFiles`'/tree final state, not the metadata `sha` field, to tell these apart. `unclear — needs human input: whether the chosen approach for iris-1 needs an explicit marker to distinguish these, or relies purely on final-state tree-membership checks that occur after both code paths have had a chance to populate `treeFiles``.
+- **Manifest path itself in the "remote only"/"local only" loops**: unlike the `commonFiles` loop (`sync-manager.ts:1133-1136`), which explicitly skips `MANIFEST_FILE_NAME`, the "files in remote but not in local" and "files in local but not in remote" loops (`sync-manager.ts:1200-1232`) have no equivalent manifest-path guard — relying instead on the manifest always being present on both sides in practice. Not confirmed whether `metadataStore.data.files` ever tracks the manifest's own path as a `FileMetadata` entry; `unclear — needs human input: confirm whether the manifest path can ever appear in this loop, or whether it's structurally guaranteed absent from `metadataStore.data.files`` — relevant only if the fix touches these loops directly.
+- **First-sync paths cannot exhibit this bug**: `firstSyncFromRemote()` (`sync-manager.ts:262-371`) and `firstSyncFromLocal()` (`sync-manager.ts:381-440`) both build their tree from either the ZIP-extracted file set or a full enumeration of local metadata — neither seeds `newTreeFiles` from a stale base tree the way `syncImpl()` does. Confirms the drift is possible only through the regular-sync code path, narrowing where a fix needs to apply the new invariant.
+
+## Implementation Steps
+
+N/A — analysis only.

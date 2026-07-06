@@ -246,7 +246,7 @@ describe('SyncManager - Filename Context in Filesystem Error Messages', () => {
       );
 
       await expect(
-        (syncManager as any).commitSync(treeFiles, 'treeSha'),
+        (syncManager as any).commitSync(treeFiles, 'treeSha', {}),
       ).rejects.toThrow('Failed to read binary file');
     });
 
@@ -259,8 +259,69 @@ describe('SyncManager - Filename Context in Filesystem Error Messages', () => {
       };
 
       await expect(
-        (syncManager as any).commitSync(treeFiles, 'treeSha'),
+        (syncManager as any).commitSync(treeFiles, 'treeSha', {}),
       ).rejects.toThrow('Failed to upload binary blob');
+    });
+  });
+
+  describe('commitSync manifest snapshot (plan-fix-manifest-tree-drift-and-cleanup)', () => {
+    const manifestPath = '.obsidian/github-sync-metadata.json';
+
+    beforeEach(() => {
+      (syncManager as any).client = {
+        createTree: vi.fn().mockResolvedValue('new-tree-sha'),
+        getBranchHeadSha: vi.fn().mockResolvedValue('branch-head-sha'),
+        createCommit: vi.fn().mockResolvedValue('commit-sha'),
+        updateBranchHead: vi.fn().mockResolvedValue(undefined),
+      };
+    });
+
+    it('builds the manifest content strictly from the passed-in snapshot, never from a live-only key', async () => {
+      (syncManager as any).metadataStore = {
+        data: {
+          lastSync: 0,
+          files: {
+            'live-only.md': { path: 'live-only.md', sha: null, dirty: true, justDownloaded: false, lastModified: 0 },
+          },
+        },
+        save: vi.fn(),
+      };
+      const snapshot = {
+        'notes/todo.md': { path: 'notes/todo.md', sha: 'old-sha', dirty: false, justDownloaded: false, lastModified: 0 },
+      };
+      const treeFiles = {
+        [manifestPath]: { path: manifestPath, mode: '100644', type: 'blob', sha: 'old-manifest-sha' },
+      } as any;
+
+      await (syncManager as any).commitSync(treeFiles, 'treeSha', snapshot);
+
+      const manifestContent = JSON.parse(treeFiles[manifestPath].content);
+      expect(manifestContent.files).toEqual(snapshot);
+      expect(manifestContent.files['live-only.md']).toBeUndefined();
+    });
+
+    it('preserves a live-only key (added after the snapshot was taken) after a successful commit', async () => {
+      (syncManager as any).metadataStore = {
+        data: {
+          lastSync: 0,
+          files: {
+            'live-only.md': { path: 'live-only.md', sha: null, dirty: true, justDownloaded: false, lastModified: 0 },
+          },
+        },
+        save: vi.fn(),
+      };
+      const snapshot = {
+        'notes/todo.md': { path: 'notes/todo.md', sha: 'old-sha', dirty: false, justDownloaded: false, lastModified: 0 },
+      };
+      const treeFiles = {
+        [manifestPath]: { path: manifestPath, mode: '100644', type: 'blob', sha: 'old-manifest-sha' },
+      } as any;
+
+      await (syncManager as any).commitSync(treeFiles, 'treeSha', snapshot);
+
+      expect((syncManager as any).metadataStore.data.files['live-only.md']).toEqual({
+        path: 'live-only.md', sha: null, dirty: true, justDownloaded: false, lastModified: 0,
+      });
     });
   });
 
@@ -624,6 +685,28 @@ describe('SyncManager - Filename Context in Filesystem Error Messages', () => {
       expect(computeExcludedRemoteOrphans(files)).toEqual([
         { type: 'delete_remote', filePath: '.obsidian/plugins/foo/.hidden' },
       ]);
+    });
+  });
+
+  describe('isPhantomManifestEntry (plan-fix-manifest-tree-drift-and-cleanup)', () => {
+    it('returns true when the path has no entry in the raw remote tree', () => {
+      const isPhantomManifestEntry = (syncManager as any).isPhantomManifestEntry.bind(syncManager);
+
+      const files = {
+        'notes/todo.md': { path: 'notes/todo.md', sha: 'other-sha' },
+      };
+
+      expect(isPhantomManifestEntry(files, 'Operasi.md')).toBe(true);
+    });
+
+    it('returns false when the path resolves to a valid tree item', () => {
+      const isPhantomManifestEntry = (syncManager as any).isPhantomManifestEntry.bind(syncManager);
+
+      const files = {
+        'notes/todo.md': { path: 'notes/todo.md', sha: 'other-sha' },
+      };
+
+      expect(isPhantomManifestEntry(files, 'notes/todo.md')).toBe(false);
     });
   });
 

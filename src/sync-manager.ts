@@ -367,7 +367,10 @@ export default class SyncManager {
           };
         }),
     );
-    await this.commitSync(newTreeFiles, treeSha);
+    const localSnapshot: { [key: string]: FileMetadata } = Object.fromEntries(
+      Object.entries(this.metadataStore.data.files).map(([k, v]) => [k, { ...v }]),
+    );
+    await this.commitSync(newTreeFiles, treeSha, localSnapshot);
   }
 
   /**
@@ -436,7 +439,10 @@ export default class SyncManager {
           };
         }),
     );
-    await this.commitSync(newTreeFiles, treeSha);
+    const localSnapshot: { [key: string]: FileMetadata } = Object.fromEntries(
+      Object.entries(this.metadataStore.data.files).map(([k, v]) => [k, { ...v }]),
+    );
+    await this.commitSync(newTreeFiles, treeSha, localSnapshot);
   }
 
   /**
@@ -508,6 +514,17 @@ export default class SyncManager {
 
     const migratedOldKeys = await this.migrateIllegalFilenames(remoteMetadata.files);
 
+    // Frozen snapshot of local metadata, taken after reconcileConfigDirFiles() and
+    // migrateIllegalFilenames() have applied their own legitimate this-sync mutations.
+    // Everything from here on (action determination, manifest content) reads/writes this
+    // snapshot instead of the live this.metadataStore.data.files object, so a concurrent
+    // vault event (e.g. another plugin writing a file while this sync awaits a GitHub API
+    // round-trip) can never leak a file reference into this commit's manifest without a
+    // matching tree item — it stays live-only and is picked up on the next sync.
+    const localSnapshot: { [key: string]: FileMetadata } = Object.fromEntries(
+      Object.entries(this.metadataStore.data.files).map(([k, v]) => [k, { ...v }]),
+    );
+
     const conflicts = await this.findConflicts(remoteMetadata.files, files);
     const filteredConflicts = conflicts.filter(c => !migratedOldKeys.has(c.filePath));
 
@@ -560,7 +577,7 @@ export default class SyncManager {
     const actions: SyncAction[] = [
       ...(await this.determineSyncActions(
         remoteMetadata.files,
-        this.metadataStore.data.files,
+        localSnapshot,
         conflictActions.map((action) => action.filePath),
       )),
       ...conflictActions,
@@ -596,7 +613,7 @@ export default class SyncManager {
         switch (action.type) {
           case "upload": {
             const normalizedPath = normalizePath(action.filePath);
-            const localPath = this.metadataStore.data.files[action.filePath]?.localPath ?? normalizedPath;
+            const localPath = localSnapshot[action.filePath]?.localPath ?? normalizedPath;
             if (!(await this.vault.adapter.exists(localPath))) {
               // File was removed from disk without the delete event being tracked
               // (e.g., a plugin folder deleted via Obsidian UI). Treat as a remote
@@ -605,10 +622,9 @@ export default class SyncManager {
                 "Upload action skipped: file no longer exists, treating as delete_remote",
                 action.filePath,
               );
-              if (this.metadataStore.data.files[action.filePath]) {
-                this.metadataStore.data.files[action.filePath].deleted = true;
-                this.metadataStore.data.files[action.filePath].deletedAt =
-                  Date.now();
+              if (localSnapshot[action.filePath]) {
+                localSnapshot[action.filePath].deleted = true;
+                localSnapshot[action.filePath].deletedAt = Date.now();
               }
               if (newTreeFiles[action.filePath]) {
                 newTreeFiles[action.filePath].sha = null;
@@ -660,6 +676,27 @@ export default class SyncManager {
       ...actions
         .filter((action) => action.type === "download")
         .map(async (action: SyncAction) => {
+          if (this.isPhantomManifestEntry(files, action.filePath)) {
+            // The manifest lists this path as live but the raw remote tree has no
+            // matching item for it (e.g. a drift-causing race on the device that
+            // committed it). Don't crash — tombstone it in the snapshot so the
+            // manifest this sync commits marks it deleted, converging the remote
+            // state instead of repeating this on every future sync.
+            await this.logger.warn(
+              "Download action skipped: manifest references a file missing from the remote tree",
+              action.filePath,
+            );
+            localSnapshot[action.filePath] = {
+              path: action.filePath,
+              sha: null,
+              dirty: false,
+              justDownloaded: false,
+              lastModified: Date.now(),
+              deleted: true,
+              deletedAt: Date.now(),
+            };
+            return;
+          }
           await this.downloadFile(
             files[action.filePath],
             remoteMetadata.files[action.filePath].lastModified,
@@ -672,7 +709,7 @@ export default class SyncManager {
         }),
     ]);
 
-    await this.commitSync(newTreeFiles, treeSha, conflictResolutions);
+    await this.commitSync(newTreeFiles, treeSha, localSnapshot, conflictResolutions);
     return excludedRemoteOrphans.length;
   }
 
@@ -748,6 +785,17 @@ export default class SyncManager {
       .filter((filePath) => filePath !== `${this.vault.configDir}/${MANIFEST_FILE_NAME}`)
       .filter((filePath) => !this.isPathSyncable(filePath))
       .map((filePath) => ({ type: "delete_remote", filePath }));
+  }
+
+  /**
+   * True when the manifest lists filePath as live but the raw remote tree
+   * (the actual git commit) has no matching item for it.
+   */
+  private isPhantomManifestEntry(
+    files: { [key: string]: GetTreeResponseItem },
+    filePath: string,
+  ): boolean {
+    return files[filePath] === undefined;
   }
 
   private filterRemoteMetadataFiles(filesMetadata: {
@@ -1299,6 +1347,7 @@ export default class SyncManager {
   async commitSync(
     treeFiles: { [key: string]: NewTreeRequestItem },
     baseTreeSha: string,
+    localMetadataSnapshot: { [key: string]: FileMetadata },
     conflictResolutions: ConflictResolution[] = [],
   ) {
     // Update local sync time
@@ -1314,9 +1363,9 @@ export default class SyncManager {
     // on the remote metadata we update the timestamp for the conflicting files here,
     // just before pushing to remote.
     // We're going to update the local content when the sync is successful.
+    // This targets the snapshot (not live data) since it feeds the manifest content below.
     conflictResolutions.forEach((resolution) => {
-      this.metadataStore.data.files[resolution.filePath].lastModified =
-        syncTime;
+      localMetadataSnapshot[resolution.filePath].lastModified = syncTime;
     });
 
     // We want the remote metadata file to track the correct SHA for each file blob,
@@ -1339,10 +1388,10 @@ export default class SyncManager {
           // on them if it makes the plugin handle upload better on certain devices.
           if (hasTextExtension(filePath)) {
             const sha = await this.calculateSHAFromString(treeFiles[filePath].content as string);
-            if (this.metadataStore.data.files[filePath]) {
-              this.metadataStore.data.files[filePath].sha = sha;
+            if (localMetadataSnapshot[filePath]) {
+              localMetadataSnapshot[filePath].sha = sha;
             } else {
-              this.metadataStore.data.files[filePath] = {
+              localMetadataSnapshot[filePath] = {
                 path: filePath,
                 sha: sha,
                 dirty: false,
@@ -1385,10 +1434,10 @@ export default class SyncManager {
           // Can't have both sha and content set, so we delete it
           delete treeFiles[filePath].content;
 
-          if (this.metadataStore.data.files[filePath]) {
-            this.metadataStore.data.files[filePath].sha = sha;
+          if (localMetadataSnapshot[filePath]) {
+            localMetadataSnapshot[filePath].sha = sha;
           } else {
-            this.metadataStore.data.files[filePath] = {
+            localMetadataSnapshot[filePath] = {
               path: filePath,
               sha: sha,
               dirty: false,
@@ -1400,10 +1449,12 @@ export default class SyncManager {
         }),
     );
 
-    // Update manifest in list of new tree items
+    // Update manifest in list of new tree items. Built from the snapshot (not live
+    // metadataStore.data) so a concurrent vault event mutating live data mid-sync can
+    // never leak a file reference into the manifest without a matching tree item.
     delete treeFiles[`${this.vault.configDir}/${MANIFEST_FILE_NAME}`].sha;
     treeFiles[`${this.vault.configDir}/${MANIFEST_FILE_NAME}`].content =
-      JSON.stringify(this.metadataStore.data);
+      JSON.stringify({ lastSync: this.metadataStore.data.lastSync, files: localMetadataSnapshot });
 
     // Create the new tree
     const newTree: { tree: NewTreeRequestItem[]; base_tree: string } = {
@@ -1428,6 +1479,12 @@ export default class SyncManager {
     });
 
     await this.client.updateBranchHead({ sha: commitSha, retry: true });
+
+    // Merge this sync's outcome (sha updates, tombstones) back into live metadata.
+    // Object.assign only overwrites keys present in the snapshot, so a key added to
+    // live data by a concurrent vault event during this sync (never part of the
+    // snapshot) survives untouched and is picked up on the next sync.
+    Object.assign(this.metadataStore.data.files, localMetadataSnapshot);
 
     // Update the local content of all files that had conflicts we resolved
     await Promise.all(

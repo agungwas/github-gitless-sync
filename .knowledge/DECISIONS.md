@@ -1,7 +1,12 @@
 ---
-updated: "2026-07-05"
+updated: "2026-07-07"
 ---
 # Decisions
+
+## 2026-07-07 — Fix Manifest/Tree Drift Race + Crash Guard + Stuck-Entry Convergence
+**Chose:** snapshot-freeze — one immutable local-metadata snapshot taken right after `reconcileConfigDirFiles()`/`migrateIllegalFilenames()` apply, used as the single source for both `determineSyncActions()` and `commitSync()`'s manifest write, merged back into live metadata post-commit — plus a download-crash guard that tombstones any manifest entry missing from the raw remote tree, for `sync`. **Over:** re-scan-and-fold before commit (duplicates upload-branch content/binary handling and its own missing-file race, for only a one-cycle-sooner benefit); guard-only with the race left open (recurring band-aid, doesn't satisfy the human's chosen "harden root-cause" scope).
+**Why:** Root-caused via `iris-0a-explore`/`iris-0b-check-impact`: a concurrent vault event (e.g. another plugin writing its data file) during an in-flight multi-second sync mutates the *live* `metadataStore.data.files` object after `determineSyncActions()` already froze the action list, so `commitSync()`'s manifest dump (which reads live data) includes a file the git tree commit never received — crashing every subsequent sync's download attempt for that phantom path (`Operasi.md`, reproduced 2026-07-06).
+**Plan:** ./features/sync/plans/plan-fix-manifest-tree-drift-and-cleanup.md
 
 ## 2026-07-05 — Widen Remote-Orphan Cleanup to Cover syncConfigDir-Off Files
 **Chose:** swap `computeExcludedRemoteOrphans()`'s filter from `shouldSkipFile()` to `!isPathSyncable()` (strict widening — every prior case still caught), for `sync`. **Over:** duplicating the syncConfigDir/dot-file checks inline (same duplication problem already rejected once); widening `shouldSkipFile()` itself (risks double-negation at its other call sites, which have their own separate syncConfigDir checks).

@@ -231,7 +231,8 @@ describe('SyncManager - Sanitize Remote Convergence Migration', () => {
 
     const resolutions = [{ filePath: 'Books/x >.md', content: 'new content' }];
     const treeFiles = { '.obsidian/github-sync-metadata.json': { content: '{}' } } as any;
-    await (syncManager as any).commitSync(treeFiles, 'tree', resolutions);
+    const snapshot = { 'Books/x >.md': { ...(syncManager as any).metadataStore.data.files['Books/x >.md'] } };
+    await (syncManager as any).commitSync(treeFiles, 'tree', snapshot, resolutions);
 
     expect(mockVault.adapter.write).toHaveBeenCalledWith('Books/x ＞.md', 'new content');
     expect(mockVault.adapter.write).not.toHaveBeenCalledWith('Books/x >.md', expect.anything());
