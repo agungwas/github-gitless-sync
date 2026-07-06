@@ -1,5 +1,6 @@
 ---
-status: in-progress
+status: done
+completed: "2026-07-07"
 slug: fix-manifest-tree-drift-and-cleanup
 created: "2026-07-07"
 testing: tdd

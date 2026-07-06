@@ -1,7 +1,7 @@
 ---
-last_updated: "2026-07-06"
-updated_by_plan: "plan-fix-syncconfigdir-remote-orphans.md"
-decision: "2026-07-05 — Widen Remote-Orphan Cleanup to Cover syncConfigDir-Off Files"
+last_updated: "2026-07-07"
+updated_by_plan: "plan-fix-manifest-tree-drift-and-cleanup.md"
+decision: "2026-07-07 — Fix Manifest/Tree Drift Race + Crash Guard + Stuck-Entry Convergence"
 ---
 # Sync Feature
 
@@ -76,14 +76,30 @@ syncImpl(): Promise<number>                    → count of exclude/syncConfigDi
   4. filterRemoteMetadataFiles()               → strip volatile from remote metadata
   5. reconcileRemoteMetadataWithTree()         → fix stale SHAs in remote metadata
   5.5. migrateIllegalFilenames()               → migratedOldKeys (Set<string>)
+  5.6. capture localSnapshot                   → frozen per-entry copy of metadataStore.data.files, taken here (after reconcile + migration have applied their mutations, before anything long-running)
   6. findConflicts()                           → ConflictFile[] (excluding migratedOldKeys)
   7. resolve conflicts (per conflictHandling setting)
-  8. determineSyncActions() + computeExcludedRemoteOrphans() → SyncAction[] (the latter appends delete_remote for paths isPathSyncable() now says aren't synced but are still in the raw remote tree)
-  9. apply upload/delete_remote to newTreeFiles dict
-  10. parallel: download files + delete local files
-  11. commitSync(newTreeFiles, treeSha, conflictResolutions)
+  8. determineSyncActions(remoteMetadata.files, localSnapshot, ...) + computeExcludedRemoteOrphans() → SyncAction[] (the latter appends delete_remote for paths isPathSyncable() now says aren't synced but are still in the raw remote tree)
+  9. apply upload/delete_remote to newTreeFiles dict + localSnapshot (upload-skip tombstones write to localSnapshot, not live metadata)
+  10. parallel: download files (guarded by isPhantomManifestEntry(), see Manifest/Tree Consistency below) + delete local files
+  11. commitSync(newTreeFiles, treeSha, localSnapshot, conflictResolutions)
   12. return excludedRemoteOrphans.length        → sync() appends "(N removed from remote due to exclude patterns)" to the success Notice when > 0
 ```
+
+### Manifest/Tree Consistency (Snapshot-Freeze)
+
+Added 2026-07-07 (`plan-fix-manifest-tree-drift-and-cleanup.md`), fixing a crash reproduced 2026-07-06 (`"Cannot read properties of undefined (reading 'path')"`).
+
+**Problem this closes:** `syncImpl()` spans several `await`ed network round-trips (multiple seconds). A concurrent vault event (another plugin writing its data file, a note created while sync is in flight) mutates the live `metadataStore.data.files` object during that window. If `determineSyncActions()`'s frozen action list was computed before the event and `commitSync()`'s manifest write read live data after it, the committed manifest could reference a file with no corresponding git-tree item — every later sync (any device) then crashes trying to download that phantom path.
+
+**Fix — `localSnapshot`:** `syncImpl()` takes one shallow-per-entry copy of `metadataStore.data.files` right after `reconcileConfigDirFiles()`/`migrateIllegalFilenames()` apply their own this-sync mutations (step 5.6 above), before `findConflicts()`/`determineSyncActions()` run. That snapshot — not live data — is the single source for:
+- `determineSyncActions()`'s local-files argument
+- the upload-action-skip tombstone (`sync-manager.ts` upload branch: file missing from disk → `localSnapshot[filePath].deleted = true`)
+- `commitSync()`'s manifest content (`JSON.stringify({ lastSync, files: localMetadataSnapshot })`)
+
+`commitSync(treeFiles, baseTreeSha, localMetadataSnapshot, conflictResolutions = [])` now requires the snapshot as its 3rd parameter (all 3 call sites — `syncImpl()`, `firstSyncFromRemote()`, `firstSyncFromLocal()` — pass one). Its own SHA-computation loop and pre-commit conflict-`lastModified` stamp write into the snapshot, not live data. After `updateBranchHead()` succeeds, `Object.assign(this.metadataStore.data.files, localMetadataSnapshot)` merges the sync's outcome back into live metadata — any key added to live data by a concurrent event during the sync (never part of the snapshot) is left untouched and picked up as an ordinary action on the next sync.
+
+**Crash guard — `isPhantomManifestEntry()`:** before calling `downloadFile()`, the download branch checks `isPhantomManifestEntry(files, action.filePath)` (`files` = the raw tree from `getRepoContent()`). If the manifest lists a path `getRepoContent()`'s tree doesn't have, the download is skipped (no crash) and the path is tombstoned into `localSnapshot` (`sha: null, deleted: true, deletedAt: now`) — the manifest committed at the end of that same sync marks it deleted, converging the remote state within one sync instead of repeating the crash indefinitely.
 
 ### Conflict Detection (`findConflicts()`)
 
@@ -271,9 +287,7 @@ A **"Preview pattern matches"** button (same date) triggers `showPatternPreview(
 
 ## Known Gaps / TODOs in Code
 
-- **CRASH BUG (manifest references a file with no corresponding tree entry)**: `determineSyncActions()` (`sync-manager.ts:1200-1214`, "files in remote but not in local" branch) pushes a `download` action for any path present in `remoteMetadata.files` (the manifest, parsed from the manifest blob) and absent from local metadata, without checking whether that path actually exists in the raw GitHub tree (`files`, from `getRepoContent()`). The download is attempted at `sync-manager.ts:662-667` via `this.downloadFile(files[action.filePath], remoteMetadata.files[action.filePath].lastModified)` — if `files[action.filePath]` is `undefined`, `downloadFile()` (`sync-manager.ts:1460-1461`) immediately reads `file.path` on it, throwing `"Cannot read properties of undefined (reading 'path')"` and aborting the whole sync (caught at `sync-manager.ts:469`, logged as `"Error syncing"`). Reproduced 2026-07-06 with `Operasi.md`, a file newly created on another device — not a deletion-bypass case. The crash repeated across consecutive sync attempts (17:35 and 17:36 in the same log), meaning the remote repo's current commit genuinely has this drift baked in, not a transient GitHub API race.
-  - **Root structural cause**: `commitSync()` (`sync-manager.ts:1403-1406`) writes the manifest blob as `JSON.stringify(this.metadataStore.data)` — the sync-initiating device's *entire* local metadata map, unconditionally — with no check that every entry it contains actually has a corresponding item in `treeFiles`/the tree being committed (`treeFiles` is seeded from the old base tree plus only the files this sync's `determineSyncActions()` chose to `upload`, `sync-manager.ts:577-656`). If a local metadata entry for a new, non-deleted file exists on the sending device without ever being included in that device's own tree commit (exact precipitating trigger not confirmed from a single device's log — candidates include a sync interrupted/failed after `metadataStore.save()` but before `commitSync()`, or an earlier historical sync where the file was present in both local and remote metadata but never made it into a committed tree), the manifest permanently "phantom-references" that file once committed.
-  - **No self-healing exists**: `reconcileRemoteMetadataWithTree()` (`sync-manager.ts:845-876`) only fixes SHA drift for entries that already match a tree file (`metadataFile.sha !== remoteTreeFile.sha`); when `remoteRepoFiles[filePath]` is undefined it just `return`s at line 861, leaving the phantom entry untouched (not marked `deleted`, not removed). `determineSyncActions()` trusts the manifest's presence/`deleted` flag unconditionally. So every device that syncs afterward regenerates the same `download` action for the phantom path and crashes — the bug is sticky at the repo level until the manifest itself is manually edited or the missing blob is somehow added to the tree.
+- **FIXED 2026-07-07** (`plan-fix-manifest-tree-drift-and-cleanup.md`) — manifest referencing a file with no corresponding tree entry used to crash the whole sync (`"Cannot read properties of undefined (reading 'path')"`, reproduced 2026-07-06 with `Operasi.md`). Root cause was a race: a concurrent vault event could mutate live local metadata between `determineSyncActions()` freezing its action list and `commitSync()` reading live data for the manifest. See `## Manifest/Tree Consistency (Snapshot-Freeze)` above for the fix (`localSnapshot` + `isPhantomManifestEntry()` guard).
 - **Mobile-illegal filenames abort the whole sync**: `downloadFile()` (`sync-manager.ts:1226`) writes via `vault.adapter.writeBinary(normalizedPath, ...)` with no filename sanitization. If a remote file's name contains a character the mobile OS filesystem rejects (e.g. `>` `<` `:` `"` `|` `?` `*` — legal on macOS/Linux, so the file can be created on desktop and pushed to GitHub), the mobile adapter throws `FILE_NOTCREATED` and the error propagates out of `syncImpl()` (caught at `sync-manager.ts:413`), aborting the entire sync before `commitSync()` runs. No sanitization or skip-and-continue exists anywhere in `src/`. Observed 2026-06-17 on a download of `Books/Multibagger Cara Meraih Profit >100% dari Pasar Saham.md`.
 - **CRITICAL BUG (Conflict Handling)**: In `syncImpl()`, when `conflictHandling` is `overwriteLocal` or `overwriteRemote`, `conflictActions` is populated by mapping over `conflictResolutions` instead of `conflicts`. Because `conflictResolutions` is empty in those branches, the conflict is ignored, falls through to `determineSyncActions`, and is incorrectly treated as an `upload` action (overwriting remote regardless of setting).
 - `commitSync`: TODO comment about not reverting SHA updates on sync failure
@@ -281,7 +295,7 @@ A **"Preview pattern matches"** button (same date) triggers `showPatternPreview(
 - `isSyncable()` in `EventsListener` has an edge case: all non-configDir files pass even if outside vault root (not reachable in practice via Obsidian events)
 - `reconcileConfigDirFiles()` not called in `firstSyncImpl()` path — if user installs plugin after startup but before first sync, `firstSyncFromLocal()` may miss those files (rare; files installed before startup are caught by `loadMetadata()` at startup)
 - `PatternPreviewModal.onOpen()` (the rendered "Will sync"/"Excluded" list markup in the Preview modal) has no test coverage — verified via typecheck + production build only, same class of Obsidian-DOM gap as `tab.ts`'s `display()`. The logic feeding it (`bucketPathsByPattern()`, `collectVaultPaths()`) is unit-tested; only the leaf-level rendering isn't.
-- `computeExcludedRemoteOrphans()`'s `delete_remote` actions are tested at the point they're produced, not through a full `syncImpl()` integration test — `syncImpl()` itself has no direct test anywhere in this codebase (pre-existing, every sub-piece is tested the same way at its own output boundary).
+- `computeExcludedRemoteOrphans()`'s `delete_remote` actions are tested at the point they're produced, not through a full `syncImpl()` integration test — `syncImpl()` itself has no direct test anywhere in this codebase (pre-existing, every sub-piece is tested the same way at its own output boundary). This also covers the `localSnapshot` capture/wiring and the `isPhantomManifestEntry()` call site added in `plan-fix-manifest-tree-drift-and-cleanup.md` (2026-07-07) — the decision logic itself (`isPhantomManifestEntry()`, `commitSync()`'s snapshot-based manifest build + merge-back, `determineSyncActions()`) is unit-tested; the `syncImpl()` orchestration wiring them together is only covered by the full suite + typecheck, same as every other `syncImpl()` piece.
 - Testing `tab.ts`'s `Setting`-heavy methods (`renderPatternList()`, `showPatternPreview()`) requires a local `vi.mock("obsidian", ...)` override inside `tab.test.ts` providing minimal `Setting`/`PluginSettingTab`/`Modal` fakes — the shared `vitest.setup.ts` mock doesn't export `Setting` at all. Any future test touching these methods needs the same local mock pattern (see `tab.test.ts` top of file).
 
 ## Update 2026-07-04
