@@ -182,11 +182,31 @@ describe('SyncManager - Filename Context in Filesystem Error Messages', () => {
         },
         save: vi.fn(),
       };
+      (mockVault.adapter.exists as ReturnType<typeof vi.fn>).mockResolvedValue(true);
       (mockVault.adapter.remove as ReturnType<typeof vi.fn>).mockRejectedValue(
         new Error('FILE_NOTFOUND'),
       );
 
       await expect(syncManager.deleteLocalFile(filePath)).rejects.toThrow(filePath);
+    });
+
+    it('skips removal and marks deleted when file is already absent on disk', async () => {
+      const filePath = 'Books/test.md';
+      const metadataEntry = { path: filePath, sha: 'abc', dirty: false, justDownloaded: false, lastModified: 0, deleted: false };
+      (syncManager as any).metadataStore = {
+        data: {
+          files: {
+            [filePath]: metadataEntry,
+          },
+        },
+        save: vi.fn(),
+      };
+      (mockVault.adapter.exists as ReturnType<typeof vi.fn>).mockResolvedValue(false);
+
+      await syncManager.deleteLocalFile(filePath);
+
+      expect(mockVault.adapter.remove).not.toHaveBeenCalled();
+      expect(metadataEntry.deleted).toBe(true);
     });
   });
 

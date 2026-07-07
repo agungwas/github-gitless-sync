@@ -1554,16 +1554,27 @@ export default class SyncManager {
 
   async deleteLocalFile(filePath: string) {
     const localPath = this.metadataStore.data.files[filePath]?.localPath ?? normalizePath(filePath);
-    try {
-      await this.vault.adapter.remove(localPath);
-    } catch (err) {
-      throw new Error(
-        `Failed to delete file ${localPath}: ${err instanceof Error ? err.message : String(err)}`,
-        { cause: err },
+    if (await this.vault.adapter.exists(localPath)) {
+      try {
+        await this.vault.adapter.remove(localPath);
+      } catch (err) {
+        throw new Error(
+          `Failed to delete file ${localPath}: ${err instanceof Error ? err.message : String(err)}`,
+          { cause: err },
+        );
+      }
+    } else {
+      // Already gone (e.g. removed by an earlier interrupted sync, or manually
+      // deleted). Goal state is achieved; don't fail the whole sync over it.
+      await this.logger.warn(
+        "Delete-local skipped: file already absent on disk",
+        filePath,
       );
     }
-    this.metadataStore.data.files[filePath].deleted = true;
-    this.metadataStore.data.files[filePath].deletedAt = Date.now();
+    if (this.metadataStore.data.files[filePath]) {
+      this.metadataStore.data.files[filePath].deleted = true;
+      this.metadataStore.data.files[filePath].deletedAt = Date.now();
+    }
     this.metadataStore.save();
   }
 

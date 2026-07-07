@@ -1,7 +1,7 @@
 ---
 last_updated: "2026-07-07"
-updated_by_plan: "plan-fix-manifest-tree-drift-and-cleanup.md"
-decision: "2026-07-07 — Fix Manifest/Tree Drift Race + Crash Guard + Stuck-Entry Convergence"
+updated_by_plan: "none (standalone iris-debug fix)"
+decision: "2026-07-07 — Guard delete_local Against ENOENT (Already-Absent File)"
 ---
 # Sync Feature
 
@@ -130,6 +130,8 @@ Internal sync files (`MANIFEST_FILE_NAME`, log file) are never checked for confl
 | File in local only | `upload` |
 
 Config dir files filtered out if `syncConfigDir=false` (except manifest).
+
+**`delete_local` ENOENT guard** (`deleteLocalFile()`, 2026-07-07, standalone `iris-debug` fix): checks `adapter.exists()` before `adapter.remove()`. If the file is already absent on disk (e.g. removed by an earlier interrupted sync, or manually deleted), skips the remove and logs a warn instead of throwing — goal state is already achieved, so the whole sync's `Promise.all` no longer aborts mid-flight over it. Mirrors the `upload` action's existing missing-file guard (above). Also guards the metadata-entry write against the entry being absent from `metadataStore.data.files` — same concurrent-mutation race class as the Manifest/Tree Consistency snapshot-freeze fix below.
 
 ### Commit Process (`commitSync()`)
 
