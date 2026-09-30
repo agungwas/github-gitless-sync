@@ -41,6 +41,21 @@ export default class GitHubSyncPlugin extends Plugin {
   // By keeping them here we can recreate it easily.
   private conflicts: ConflictFile[] = [];
 
+  // Pristine copy of the conflicts as they were found by the sync. The views
+  // edit the ConflictFile objects in place, so this is what "reset" restores.
+  private originalConflicts: ConflictFile[] = [];
+
+  // Conflicts the user already resolved but that were not yet handed to the
+  // SyncManager. Kept here so closing the view doesn't lose the progress.
+  resolvedConflicts: Map<string, ConflictResolution> = new Map();
+
+  // Shown when the conflicts view is closed with conflicts still pending.
+  private pendingConflictsNotice: Notice | null = null;
+
+  // Set while the plugin is being unloaded so closing the view then
+  // doesn't trigger any user facing behavior.
+  isUnloading = false;
+
   async onUserEnable() {
     if (
       this.settings.githubToken === "" ||
@@ -69,9 +84,8 @@ export default class GitHubSyncPlugin extends Plugin {
     if (leaves.length > 0) {
       leaf = leaves[0];
     } else {
-      const activeLeaf = workspace.getLeaf(false);
-      const isNewTabPage = activeLeaf && activeLeaf.view && activeLeaf.view.getViewType() === "empty";
-      leaf = workspace.getLeaf(!isNewTabPage ? "tab" : false)!;
+      // Always use a dedicated tab, never replace the one the user is on.
+      leaf = workspace.getLeaf("tab");
       await leaf.setViewState({
         type: CONFLICTS_RESOLUTION_VIEW_TYPE,
         active: true,
@@ -205,6 +219,8 @@ export default class GitHubSyncPlugin extends Plugin {
   }
 
   async onunload() {
+    this.isUnloading = true;
+    this.hidePendingConflictsNotice();
     this.stopSyncInterval();
   }
 
@@ -293,15 +309,116 @@ export default class GitHubSyncPlugin extends Plugin {
 
   clearConflicts() {
     this.conflicts = [];
+    this.originalConflicts = [];
+    this.resolvedConflicts.clear();
+    this.hidePendingConflictsNotice();
+  }
+
+  getConflicts(): ConflictFile[] {
+    return this.conflicts;
+  }
+
+  private cloneConflicts(conflicts: ConflictFile[]): ConflictFile[] {
+    return conflicts.map((conflict) => ({ ...conflict }));
+  }
+
+  // Sync is still waiting on the user to resolve conflicts.
+  hasPendingConflicts(): boolean {
+    return this.conflictsResolver !== null;
+  }
+
+  // Every conflict has a resolution but the user hasn't confirmed them yet,
+  // so the SyncManager is still waiting.
+  allConflictsResolved(): boolean {
+    return (
+      this.hasPendingConflicts() &&
+      this.conflicts.length > 0 &&
+      this.conflicts.every((conflict) =>
+        this.resolvedConflicts.has(conflict.filePath),
+      )
+    );
+  }
+
+  recordResolvedConflict(resolution: ConflictResolution) {
+    this.resolvedConflicts.set(resolution.filePath, resolution);
+  }
+
+  // Brings every conflict back to how it was found, discarding both the
+  // resolutions and any edit made to the files. Sync stays paused.
+  resetConflicts() {
+    this.conflicts = this.cloneConflicts(this.originalConflicts);
+    this.resolvedConflicts.clear();
+    this.hidePendingConflictsNotice();
+  }
+
+  // Hands the resolutions to the SyncManager so the sync can continue.
+  // Returns false if there was nothing waiting for them.
+  finalizeConflicts(): boolean {
+    const resolver = this.conflictsResolver;
+    if (!resolver) {
+      return false;
+    }
+    const resolutions = Array.from(this.resolvedConflicts.values());
+    this.conflictsResolver = null;
+    // Clear the stored conflicts so that re-opening the view doesn't
+    // replay the already-resolved conflicts as unresolved.
+    this.clearConflicts();
+    resolver(resolutions);
+    return true;
+  }
+
+  hidePendingConflictsNotice() {
+    this.pendingConflictsNotice?.hide();
+    this.pendingConflictsNotice = null;
+  }
+
+  // Called when the conflicts view gets closed. The sync is blocked until the
+  // conflicts are resolved, so let the user know and offer a way back.
+  showPendingConflictsNotice() {
+    this.hidePendingConflictsNotice();
+
+    const fragment = document.createDocumentFragment();
+    const message = document.createElement("div");
+    message.textContent = "Sync is paused, conflicts are still unresolved.";
+    fragment.appendChild(message);
+
+    const actions = document.createElement("div");
+    actions.style.display = "flex";
+    actions.style.gap = "var(--size-4-2)";
+    actions.style.marginTop = "var(--size-4-2)";
+
+    const resumeButton = document.createElement("button");
+    resumeButton.textContent = "Resume";
+    resumeButton.addEventListener("click", () => {
+      this.hidePendingConflictsNotice();
+      this.openConflictsView();
+    });
+    actions.appendChild(resumeButton);
+
+    const resetButton = document.createElement("button");
+    resetButton.textContent = "Reset";
+    resetButton.addEventListener("click", () => {
+      // Sync stays paused, the conflicts are just back to their initial state
+      this.resetConflicts();
+    });
+    actions.appendChild(resetButton);
+    fragment.appendChild(actions);
+
+    // A duration of 0 keeps the notice until the user dismisses it
+    this.pendingConflictsNotice = new Notice(fragment, 0);
   }
 
   async openConflictsView() {
+    this.hidePendingConflictsNotice();
     await this.activateView();
     this.getConflictsView()?.setConflictFiles(this.conflicts);
   }
 
   async onConflicts(conflicts: ConflictFile[]): Promise<ConflictResolution[]> {
     this.conflicts = conflicts;
+    this.originalConflicts = this.cloneConflicts(conflicts);
+    this.resolvedConflicts.clear();
+    this.hidePendingConflictsNotice();
     return await new Promise(async (resolve) => {
       this.conflictsResolver = resolve;
       await this.activateView();

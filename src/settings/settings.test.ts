@@ -36,6 +36,7 @@ describe("settings", () => {
       expect(DEFAULT_SETTINGS.githubBranch).toBe("main");
       expect(DEFAULT_SETTINGS.syncStrategy).toBe("manual");
       expect(DEFAULT_SETTINGS.conflictHandling).toBe("ask");
+      expect(DEFAULT_SETTINGS.conflictsAutoCloseDelay).toBe(3);
     });
 
     it("should default excludePatterns and includePatterns to empty arrays", () => {

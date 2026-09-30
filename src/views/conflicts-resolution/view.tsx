@@ -28,14 +28,25 @@ export class ConflictsResolutionView extends ItemView {
     return "Conflicts resolution";
   }
 
-  private resolveAllConflicts(resolutions: ConflictResolution[]) {
-    if (this.plugin.conflictsResolver) {
-      this.plugin.conflictsResolver(resolutions);
-      this.plugin.conflictsResolver = null;
-      // Clear the stored conflicts so that re-opening the view doesn't
-      // replay the already-resolved conflicts as unresolved.
-      this.plugin.clearConflicts();
+  private onFileResolved(resolution: ConflictResolution) {
+    this.plugin.recordResolvedConflict(resolution);
+  }
+
+  // The user confirmed the resolutions (or the countdown ended). Hand them to
+  // the sync and close the tab, there's nothing left to do here.
+  private onConfirm() {
+    if (!this.plugin.finalizeConflicts()) {
+      // Nobody was waiting for the resolutions, don't hide them by closing.
+      return;
     }
+    // Closing is deferred so we don't unmount React while it's still
+    // running one of its own event handlers.
+    setTimeout(() => this.leaf.detach(), 0);
+  }
+
+  private onReset() {
+    this.plugin.resetConflicts();
+    this.setConflictFiles(this.plugin.getConflicts());
   }
 
   setConflictFiles(conflicts: ConflictFile[]) {
@@ -75,26 +86,40 @@ export class ConflictsResolutionView extends ItemView {
       diffMode = "unified";
     }
 
+    // Conflicts resolved before the view was closed are not shown again
+    const unresolved = conflicts.filter(
+      (conflict) => !this.plugin.resolvedConflicts.has(conflict.filePath),
+    );
+    const props = {
+      initialFiles: unresolved,
+      totalCount: conflicts.length,
+      autoCloseDelay: this.plugin.settings.conflictsAutoCloseDelay,
+      onFileResolved: this.onFileResolved.bind(this),
+      onConfirm: this.onConfirm.bind(this),
+      onReset: this.onReset.bind(this),
+    };
+
     if (diffMode === "split") {
-      this.root.render(
-        <SplitView
-          key={this.renderKey}
-          initialFiles={conflicts}
-          onResolveAllConflicts={this.resolveAllConflicts.bind(this)}
-        />,
-      );
+      this.root.render(<SplitView key={this.renderKey} {...props} />);
     } else {
-      this.root.render(
-        <UnifiedView
-          key={this.renderKey}
-          initialFiles={conflicts}
-          onResolveAllConflicts={this.resolveAllConflicts.bind(this)}
-        />,
-      );
+      this.root.render(<UnifiedView key={this.renderKey} {...props} />);
     }
   }
 
   async onClose() {
-    // Nothing to clean up.
+    this.root?.unmount();
+    this.root = null;
+
+    if (this.plugin.isUnloading) {
+      return;
+    }
+    if (this.plugin.allConflictsResolved()) {
+      // Everything is resolved and only the confirmation was missing,
+      // closing the tab counts as confirming.
+      this.plugin.finalizeConflicts();
+    } else if (this.plugin.hasPendingConflicts()) {
+      // The sync is blocked until the conflicts are resolved
+      this.plugin.showPendingConflictsNotice();
+    }
   }
 }

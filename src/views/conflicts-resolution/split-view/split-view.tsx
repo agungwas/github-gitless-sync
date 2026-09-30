@@ -2,18 +2,30 @@ import * as React from "react";
 import { ConflictFile, ConflictResolution } from "src/sync-manager";
 import DiffView from "./diff-view";
 import FilesTabBar from "./files-tab-bar";
+import {
+  ConflictsResolvedScreen,
+  NoConflictsScreen,
+  ResetAllBar,
+} from "../resolution-screens";
 
 const SplitView = ({
   initialFiles,
-  onResolveAllConflicts,
+  totalCount,
+  autoCloseDelay,
+  onFileResolved,
+  onConfirm,
+  onReset,
 }: {
+  // Conflicts that still need to be resolved
   initialFiles: ConflictFile[];
-  onResolveAllConflicts: (resolutions: ConflictResolution[]) => void;
+  // All the conflicts found by the sync, including the already resolved ones
+  totalCount: number;
+  autoCloseDelay: number;
+  onFileResolved: (resolution: ConflictResolution) => void;
+  onConfirm: () => void;
+  onReset: () => void;
 }) => {
   const [files, setFiles] = React.useState(initialFiles);
-  const [resolvedConflicts, setResolvedConflicts] = React.useState<
-    ConflictResolution[]
-  >([]);
   const [currentFileIndex, setCurrentFileIndex] = React.useState(0);
   const currentFile = files.at(currentFileIndex);
 
@@ -23,24 +35,33 @@ const SplitView = ({
       (_, index) => index !== currentFileIndex,
     );
     setFiles(remainingFiles);
-    // Keep track of the resolved conflicts
-    const newResolvedConflicts = [
-      ...resolvedConflicts,
-      {
-        filePath: currentFile!.filePath,
-        content: currentFile!.localContent,
-      },
-    ];
-    setResolvedConflicts(newResolvedConflicts);
+    // Keep track of the resolved conflict
+    onFileResolved({
+      filePath: currentFile!.filePath,
+      content: currentFile!.localContent,
+    });
     // Select the previous file only if we're not already at the start
     if (currentFileIndex > 0) {
       setCurrentFileIndex(currentFileIndex - 1);
     }
-    if (remainingFiles.length === 0) {
-      // We solved all conflicts, we can resume syncing
-      onResolveAllConflicts(newResolvedConflicts);
-    }
   };
+
+  if (files.length === 0) {
+    return (
+      <React.StrictMode>
+        {totalCount === 0 ? (
+          <NoConflictsScreen />
+        ) : (
+          // We solved all conflicts, once confirmed we can resume syncing
+          <ConflictsResolvedScreen
+            delaySeconds={autoCloseDelay}
+            onConfirm={onConfirm}
+            onUndo={onReset}
+          />
+        )}
+      </React.StrictMode>
+    );
+  }
 
   return (
     <React.StrictMode>
@@ -52,66 +73,34 @@ const SplitView = ({
           justifyContent: "center",
         }}
       >
-        {files.length === 0 ? (
-          <div
-            style={{
-              position: "relative",
-              textAlign: "center",
-              alignSelf: "center",
+        {files.length < totalCount && <ResetAllBar onReset={onReset} />}
+        <FilesTabBar
+          files={files.map((f) => f.filePath)}
+          currentFile={currentFile?.filePath || ""}
+          setCurrentFileIndex={setCurrentFileIndex}
+        />
+        <div
+          style={{
+            overflow: "auto",
+            flex: 1,
+          }}
+        >
+          <DiffView
+            remoteText={currentFile?.remoteContent || ""}
+            localText={currentFile?.localContent || ""}
+            onRemoteTextChange={(content: string) => {
+              const tempFiles = [...files];
+              tempFiles[currentFileIndex].remoteContent = content;
+              setFiles(tempFiles);
             }}
-          >
-            <div
-              style={{
-                margin: "20px 0",
-                fontWeight: "var(--h2-weight)",
-                fontSize: "var(--h2-size)",
-                lineHeight: "var(--line-height-tight)",
-              }}
-            >
-              No conflicts to resolve
-            </div>
-            <div
-              style={{
-                margin: "20px 0",
-                fontSize: "var(--font-text-size)",
-                color: "var(--text-muted)",
-                lineHeight: "var(--line-height-tight)",
-              }}
-            >
-              That's good, keep going
-            </div>
-          </div>
-        ) : (
-          <>
-            <FilesTabBar
-              files={files.map((f) => f.filePath)}
-              currentFile={currentFile?.filePath || ""}
-              setCurrentFileIndex={setCurrentFileIndex}
-            />
-            <div
-              style={{
-                overflow: "auto",
-                flex: 1,
-              }}
-            >
-              <DiffView
-                remoteText={currentFile?.remoteContent || ""}
-                localText={currentFile?.localContent || ""}
-                onRemoteTextChange={(content: string) => {
-                  const tempFiles = [...files];
-                  tempFiles[currentFileIndex].remoteContent = content;
-                  setFiles(tempFiles);
-                }}
-                onLocalTextChange={(content: string) => {
-                  const tempFiles = [...files];
-                  tempFiles[currentFileIndex].localContent = content;
-                  setFiles(tempFiles);
-                }}
-                onConflictResolved={onConflictResolved}
-              />
-            </div>
-          </>
-        )}
+            onLocalTextChange={(content: string) => {
+              const tempFiles = [...files];
+              tempFiles[currentFileIndex].localContent = content;
+              setFiles(tempFiles);
+            }}
+            onConflictResolved={onConflictResolved}
+          />
+        </div>
       </div>
     </React.StrictMode>
   );
