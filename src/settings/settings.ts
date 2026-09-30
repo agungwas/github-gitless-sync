@@ -12,6 +12,9 @@ export interface GitHubSyncSettings {
   includePatterns: string[];
   conflictHandling: "overwriteLocal" | "ask" | "overwriteRemote";
   conflictViewMode: "default" | "unified" | "split";
+  // Seconds the conflicts view waits after the last conflict is resolved
+  // before closing itself. 0 closes it immediately.
+  conflictsAutoCloseDelay: number;
   showStatusBarItem: boolean;
   showSyncRibbonButton: boolean;
   showConflictsRibbonButton: boolean;
@@ -34,6 +37,7 @@ export const DEFAULT_SETTINGS: GitHubSyncSettings = {
   includePatterns: [],
   conflictHandling: "ask",
   conflictViewMode: "default",
+  conflictsAutoCloseDelay: 3,
   showStatusBarItem: true,
   showSyncRibbonButton: true,
   showConflictsRibbonButton: true,

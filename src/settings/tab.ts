@@ -8,7 +8,11 @@ import {
 } from "obsidian";
 import GitHubSyncPlugin from "src/main";
 import { copyToClipboard } from "src/utils";
-import { getCommitMessageTemplate, setCommitMessageTemplate } from "src/settings/settings";
+import {
+  DEFAULT_SETTINGS,
+  getCommitMessageTemplate,
+  setCommitMessageTemplate,
+} from "src/settings/settings";
 
 const METADATA_CLEANUP_DEBOUNCE_MS = 400;
 
@@ -476,6 +480,24 @@ export default class GitHubSyncSettingsTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           });
       });
+
+    new Setting(containerEl)
+      .setName("Conflicts view auto-close delay")
+      .setDesc(
+        "Seconds to wait before closing the conflicts view after the last conflict is resolved. Set to 0 to close it immediately.",
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder("Seconds")
+          .setValue(this.plugin.settings.conflictsAutoCloseDelay.toString())
+          .onChange(async (value) => {
+            const seconds = parseInt(value);
+            this.plugin.settings.conflictsAutoCloseDelay = Number.isNaN(seconds)
+              ? DEFAULT_SETTINGS.conflictsAutoCloseDelay
+              : Math.min(Math.max(seconds, 0), 30);
+            await this.plugin.saveSettings();
+          }),
+      );
 
     new Setting(containerEl).setName("Extra").setHeading();
 

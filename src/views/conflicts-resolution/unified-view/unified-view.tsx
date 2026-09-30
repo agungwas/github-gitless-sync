@@ -1,36 +1,39 @@
 import * as React from "react";
 import { ConflictFile, ConflictResolution } from "src/sync-manager";
 import DiffView from "./diff-view";
+import {
+  ConflictsResolvedScreen,
+  NoConflictsScreen,
+  ResetAllBar,
+} from "../resolution-screens";
 
 const UnifiedView = ({
   initialFiles,
-  onResolveAllConflicts,
+  totalCount,
+  autoCloseDelay,
+  onFileResolved,
+  onConfirm,
+  onReset,
 }: {
+  // Conflicts that still need to be resolved
   initialFiles: ConflictFile[];
-  onResolveAllConflicts: (resolutions: ConflictResolution[]) => void;
+  // All the conflicts found by the sync, including the already resolved ones
+  totalCount: number;
+  autoCloseDelay: number;
+  onFileResolved: (resolution: ConflictResolution) => void;
+  onConfirm: () => void;
+  onReset: () => void;
 }) => {
   const [files, setFiles] = React.useState(initialFiles);
-  const [resolvedConflicts, setResolvedConflicts] = React.useState<
-    ConflictResolution[]
-  >([]);
 
   const onConflictResolved = (fileIndex: number, content: string) => {
     // Remove the file from the conflicts to resolve
-    const remainingFiles = files.filter((_, index) => index !== fileIndex);
-    setFiles(remainingFiles);
-    // Keep track of the resolved conflicts
-    const newResolvedConflicts = [
-      ...resolvedConflicts,
-      {
-        filePath: files[fileIndex].filePath,
-        content,
-      },
-    ];
-    setResolvedConflicts(newResolvedConflicts);
-    if (remainingFiles.length === 0) {
-      // We solved all conflicts, we can resume syncing
-      onResolveAllConflicts(newResolvedConflicts);
-    }
+    setFiles(files.filter((_, index) => index !== fileIndex));
+    // Keep track of the resolved conflict
+    onFileResolved({
+      filePath: files[fileIndex].filePath,
+      content,
+    });
   };
 
   const renderConflict = (file: ConflictFile, index: number) => {
@@ -67,6 +70,23 @@ const UnifiedView = ({
     );
   };
 
+  if (files.length === 0) {
+    return (
+      <React.StrictMode>
+        {totalCount === 0 ? (
+          <NoConflictsScreen />
+        ) : (
+          // We solved all conflicts, once confirmed we can resume syncing
+          <ConflictsResolvedScreen
+            delaySeconds={autoCloseDelay}
+            onConfirm={onConfirm}
+            onUndo={onReset}
+          />
+        )}
+      </React.StrictMode>
+    );
+  }
+
   return (
     <React.StrictMode>
       <div
@@ -79,38 +99,8 @@ const UnifiedView = ({
           paddingBottom: "100px",
         }}
       >
-        {files.length === 0 ? (
-          <div
-            style={{
-              position: "relative",
-              textAlign: "center",
-              alignSelf: "center",
-            }}
-          >
-            <div
-              style={{
-                margin: "20px 0",
-                fontWeight: "var(--h2-weight)",
-                fontSize: "var(--h2-size)",
-                lineHeight: "var(--line-height-tight)",
-              }}
-            >
-              No conflicts to resolve
-            </div>
-            <div
-              style={{
-                margin: "20px 0",
-                fontSize: "var(--font-text-size)",
-                color: "var(--text-muted)",
-                lineHeight: "var(--line-height-tight)",
-              }}
-            >
-              That's good, keep going
-            </div>
-          </div>
-        ) : (
-          files.map(renderConflict)
-        )}
+        {files.length < totalCount && <ResetAllBar onReset={onReset} />}
+        {files.map(renderConflict)}
       </div>
     </React.StrictMode>
   );
