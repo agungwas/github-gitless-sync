@@ -29,6 +29,8 @@ import { BlobReader, Entry, Uint8ArrayWriter, ZipReader } from "@zip.js/zip.js";
 import { PluginManagerRuntime } from "./plugin-sync/runtime-bridge";
 import { PluginSyncCoordinator } from "./plugin-sync/coordinator";
 
+const MS_PER_DAY = 86_400_000;
+
 interface SyncAction {
   type: "upload" | "download" | "delete_local" | "delete_remote";
   filePath: string;
@@ -1596,6 +1598,64 @@ export default class SyncManager {
   }
 
   /**
+   * Finds tombstones that are past the retention window and whose file is gone
+   * from this vault. Returns each path with the `deletedAt` it was judged on.
+   */
+  async findExpiredTombstones(
+    files: { [key: string]: FileMetadata },
+    now: number,
+  ): Promise<Map<string, number>> {
+    const manifestPath = `${this.vault.configDir}/${MANIFEST_FILE_NAME}`;
+    const retentionMs = this.settings.tombstoneRetentionDays * MS_PER_DAY;
+    const aged = Object.entries(files).filter(
+      ([filePath, file]) =>
+        filePath !== manifestPath &&
+        file.deleted &&
+        typeof file.deletedAt === "number" &&
+        now - file.deletedAt > retentionMs,
+    );
+    const stillOnDisk = await Promise.all(
+      aged.map(([filePath, file]) => this.existsWithExactCase(file.localPath ?? normalizePath(filePath))),
+    );
+    return new Map(
+      aged.filter((_, i) => !stillOnDisk[i]).map(([filePath, file]) => [filePath, file.deletedAt as number]),
+    );
+  }
+
+  private dropTombstonesFromSnapshot(
+    snapshot: { [key: string]: FileMetadata },
+    expired: Map<string, number>,
+  ) {
+    for (const filePath of expired.keys()) delete snapshot[filePath];
+  }
+
+  /**
+   * Only drops a live row if it is still the same tombstone; a concurrent event
+   * may have recreated or re-deleted the file while the sync was running.
+   */
+  private async dropTombstonesFromLiveMetadata(expired: Map<string, number>) {
+    for (const [filePath, deletedAt] of expired) {
+      const live = this.metadataStore.data.files[filePath];
+      if (live?.deleted && live.deletedAt === deletedAt) delete this.metadataStore.data.files[filePath];
+    }
+    if (expired.size > 0) {
+      await this.logger.info("Pruned expired tombstones", [...expired.keys()]);
+    }
+  }
+
+  /**
+   * `adapter.exists` ignores letter case on macOS/Windows, so `A.md` would look present
+   * while only `a.md` is on disk. When it reports a hit, confirm the exact name is listed.
+   */
+  private async existsWithExactCase(localPath: string): Promise<boolean> {
+    if (!(await this.vault.adapter.exists(localPath))) return false;
+    const slash = localPath.lastIndexOf("/");
+    const folder = slash < 0 ? "/" : localPath.slice(0, slash);
+    const listing = await this.vault.adapter.list(folder);
+    return [...listing.files, ...listing.folders].includes(localPath);
+  }
+
+  /**
    * Calculates the SHA1 of a file given its content.
    * This is the same identical algoritm used by git to calculate
    * a blob's SHA.
@@ -1654,35 +1714,87 @@ export default class SyncManager {
     const capturedMetadataSnapshot = Object.fromEntries(
       Object.entries(localMetadataSnapshot).map(([path, file]) => [path, { ...file }]),
     );
-    // Update local sync time
     const syncTime = Date.now();
     this.metadataStore.data.lastSync = syncTime;
     this.metadataStore.save();
 
-    // We update the last modified timestamp for all files that had resolved conflicts
-    // to the the same time as the sync time.
-    // At this time we still have not written the conflict resolution content to file,
-    // so the last modified timestamp doesn't reflect that.
-    // To prevent further conflicts in future syncs and to reflect the content change
-    // on the remote metadata we update the timestamp for the conflicting files here,
-    // just before pushing to remote.
-    // We're going to update the local content when the sync is successful.
-    // This targets the snapshot (not live data) since it feeds the manifest content below.
-    conflictResolutions.filter((resolution) => this.shouldApplyConflictContent(resolution)).forEach((resolution) => {
-      localMetadataSnapshot[resolution.filePath].lastModified = syncTime;
-    });
+    this.stampResolvedConflictTimes(localMetadataSnapshot, conflictResolutions, syncTime);
+    await this.attachShasToTreeFiles(treeFiles, localMetadataSnapshot, syncTime);
 
-    // We want the remote metadata file to track the correct SHA for each file blob,
-    // so just before we upload any file we update all their SHAs in the metadata file.
-    // This also makes it easier to handle conflicts.
-    // We don't save the metadata file after setting the SHAs cause we do that when
-    // the sync is fully commited at the end.
-    // TODO: Understand whether it's a problem we don't revert the SHA setting in case of sync failure
-    //
-    // In here we also upload blob is file is a binary. We do it here because when uploading a blob we
-    // also get back its SHA, so we can set it together with other files.
-    // We also do that right before creating the new tree because we need the SHAs of those blob to
-    // correctly create it.
+    const expiredTombstones = await this.findExpiredTombstones(localMetadataSnapshot, syncTime);
+    this.dropTombstonesFromSnapshot(localMetadataSnapshot, expiredTombstones);
+
+    this.writeMetadataIntoTree(treeFiles, localMetadataSnapshot);
+    await this.pushCommit(treeFiles, baseTreeSha, baseCommitSha);
+
+    this.mergeCommittedSnapshotIntoLive(localMetadataSnapshot, capturedMetadataSnapshot);
+    await this.dropTombstonesFromLiveMetadata(expiredTombstones);
+    await this.applyResolvedConflictContent(conflictResolutions, syncTime);
+
+    // Now that the sync is done and we updated the content for conflicting files
+    // we can save the latest metadata to disk.
+    this.metadataStore.save();
+    await this.logger.info("Sync done");
+  }
+
+  /**
+   * We update the last modified timestamp for all files that had resolved conflicts
+   * to the same time as the sync time.
+   * At this time we still have not written the conflict resolution content to file,
+   * so the last modified timestamp doesn't reflect that.
+   * To prevent further conflicts in future syncs and to reflect the content change
+   * on the remote metadata we update the timestamp for the conflicting files here,
+   * just before pushing to remote.
+   * This targets the snapshot (not live data) since it feeds the manifest content.
+   */
+  private stampResolvedConflictTimes(
+    snapshot: { [key: string]: FileMetadata },
+    conflictResolutions: ConflictResolution[],
+    syncTime: number,
+  ) {
+    conflictResolutions
+      .filter((resolution) => this.shouldApplyConflictContent(resolution))
+      .forEach((resolution) => {
+        snapshot[resolution.filePath].lastModified = syncTime;
+      });
+  }
+
+  private recordSnapshotSha(
+    snapshot: { [key: string]: FileMetadata },
+    filePath: string,
+    sha: string,
+    syncTime: number,
+  ) {
+    if (snapshot[filePath]) {
+      snapshot[filePath].sha = sha;
+      return;
+    }
+    snapshot[filePath] = {
+      path: filePath,
+      sha,
+      dirty: false,
+      justDownloaded: false,
+      lastModified: syncTime,
+      deleted: false,
+    };
+  }
+
+  /**
+   * We want the remote metadata file to track the correct SHA for each file blob,
+   * so just before we upload any file we update all their SHAs in the metadata file.
+   * This also makes it easier to handle conflicts.
+   * We don't save the metadata file after setting the SHAs cause we do that when
+   * the sync is fully commited at the end.
+   * TODO: Understand whether it's a problem we don't revert the SHA setting in case of sync failure
+   *
+   * Binary blobs are uploaded here too: uploading returns their SHA, and the new tree
+   * needs those SHAs to be created.
+   */
+  private async attachShasToTreeFiles(
+    treeFiles: { [key: string]: NewTreeRequestItem },
+    snapshot: { [key: string]: FileMetadata },
+    syncTime: number,
+  ) {
     await Promise.all(
       Object.keys(treeFiles)
         .filter((filePath: string) => treeFiles[filePath].content)
@@ -1692,78 +1804,70 @@ export default class SyncManager {
           // on them if it makes the plugin handle upload better on certain devices.
           if (hasTextExtension(filePath)) {
             const sha = await this.calculateSHAFromString(treeFiles[filePath].content as string);
-            if (localMetadataSnapshot[filePath]) {
-              localMetadataSnapshot[filePath].sha = sha;
-            } else {
-              localMetadataSnapshot[filePath] = {
-                path: filePath,
-                sha: sha,
-                dirty: false,
-                justDownloaded: false,
-                lastModified: syncTime,
-                deleted: false,
-              };
-            }
+            this.recordSnapshotSha(snapshot, filePath, sha, syncTime);
             return;
           }
 
-          // We can't upload binary files by setting the content of a tree item,
-          // we first need to create a Git blob by uploading the file, then
-          // we must update the tree item to point the SHA to the blob we just created.
-          let buffer: ArrayBuffer;
-          try {
-            buffer = await this.vault.adapter.readBinary(filePath);
-          } catch (err) {
-            throw new Error(
-              `Failed to read binary file ${filePath}: ${err instanceof Error ? err.message : String(err)}`,
-              { cause: err },
-            );
-          }
-          let sha: string;
-          try {
-            const result = await this.client.createBlob({
-              content: arrayBufferToBase64(buffer),
-              retry: true,
-              maxRetries: 3,
-            });
-            sha = result.sha;
-          } catch (err) {
-            throw new Error(
-              `Failed to upload binary blob for ${filePath}: ${err instanceof Error ? err.message : String(err)}`,
-              { cause: err },
-            );
-          }
-          await this.logger.info("Created blob", filePath);
+          const sha = await this.uploadBinaryBlob(filePath);
           treeFiles[filePath].sha = sha;
           // Can't have both sha and content set, so we delete it
           delete treeFiles[filePath].content;
-
-          if (localMetadataSnapshot[filePath]) {
-            localMetadataSnapshot[filePath].sha = sha;
-          } else {
-            localMetadataSnapshot[filePath] = {
-              path: filePath,
-              sha: sha,
-              dirty: false,
-              justDownloaded: false,
-              lastModified: syncTime,
-              deleted: false,
-            };
-          }
+          this.recordSnapshotSha(snapshot, filePath, sha, syncTime);
         }),
     );
+  }
 
-    // Update manifest in list of new tree items. Built from the snapshot (not live
-    // metadataStore.data) so a concurrent vault event mutating live data mid-sync can
-    // never leak a file reference into the manifest without a matching tree item.
-    delete treeFiles[`${this.vault.configDir}/${MANIFEST_FILE_NAME}`].sha;
-    treeFiles[`${this.vault.configDir}/${MANIFEST_FILE_NAME}`].content =
-      JSON.stringify({
-        lastSync: this.metadataStore.data.lastSync,
-        files: localMetadataSnapshot,
+  // We can't upload binary files by setting the content of a tree item,
+  // we first need to create a Git blob by uploading the file, then
+  // we must update the tree item to point the SHA to the blob we just created.
+  private async uploadBinaryBlob(filePath: string): Promise<string> {
+    let buffer: ArrayBuffer;
+    try {
+      buffer = await this.vault.adapter.readBinary(filePath);
+    } catch (err) {
+      throw new Error(
+        `Failed to read binary file ${filePath}: ${err instanceof Error ? err.message : String(err)}`,
+        { cause: err },
+      );
+    }
+    let sha: string;
+    try {
+      const result = await this.client.createBlob({
+        content: arrayBufferToBase64(buffer),
+        retry: true,
+        maxRetries: 3,
       });
+      sha = result.sha;
+    } catch (err) {
+      throw new Error(
+        `Failed to upload binary blob for ${filePath}: ${err instanceof Error ? err.message : String(err)}`,
+        { cause: err },
+      );
+    }
+    await this.logger.info("Created blob", filePath);
+    return sha;
+  }
 
-    // Create the new tree
+  // Built from the snapshot (not live metadataStore.data) so a concurrent vault event
+  // mutating live data mid-sync can never leak a file reference into the manifest
+  // without a matching tree item.
+  private writeMetadataIntoTree(
+    treeFiles: { [key: string]: NewTreeRequestItem },
+    snapshot: { [key: string]: FileMetadata },
+  ) {
+    const metadataItem = treeFiles[`${this.vault.configDir}/${MANIFEST_FILE_NAME}`];
+    delete metadataItem.sha;
+    metadataItem.content = JSON.stringify({
+      lastSync: this.metadataStore.data.lastSync,
+      files: snapshot,
+    });
+  }
+
+  private async pushCommit(
+    treeFiles: { [key: string]: NewTreeRequestItem },
+    baseTreeSha: string,
+    baseCommitSha?: string,
+  ) {
     const newTree: { tree: NewTreeRequestItem[]; base_tree: string } = {
       tree: Object.keys(treeFiles).map(
         (filePath: string) => treeFiles[filePath],
@@ -1776,9 +1880,7 @@ export default class SyncManager {
     });
 
     const branchHeadSha = baseCommitSha ?? await this.client.getBranchHeadSha({ retry: true });
-
     const message = SyncManager.buildCommitMessage(getCommitMessageTemplate());
-
     const commitSha = await this.client.createCommit({
       message,
       treeSha: newTreeSha,
@@ -1786,9 +1888,14 @@ export default class SyncManager {
     });
 
     await this.client.updateBranchHead({ sha: commitSha, retry: true });
+  }
 
-    for (const [path, committedFile] of Object.entries(localMetadataSnapshot)) {
-      const capturedFile = capturedMetadataSnapshot[path];
+  private mergeCommittedSnapshotIntoLive(
+    committed: { [key: string]: FileMetadata },
+    captured: { [key: string]: FileMetadata },
+  ) {
+    for (const [path, committedFile] of Object.entries(committed)) {
+      const capturedFile = captured[path];
       const liveFile = this.metadataStore.data.files[path];
       if (!capturedFile) {
         if (!liveFile) this.metadataStore.data.files[path] = committedFile;
@@ -1798,35 +1905,35 @@ export default class SyncManager {
         this.metadataStore.data.files[path] = committedFile;
       }
     }
+  }
 
-    // Update the local content of all files that had conflicts we resolved
+  // Update the local content of all files that had conflicts we resolved.
+  private async applyResolvedConflictContent(
+    conflictResolutions: ConflictResolution[],
+    syncTime: number,
+  ) {
     await Promise.all(
       conflictResolutions
         .filter((resolution) => this.shouldApplyConflictContent(resolution))
         .map(async (resolution) => {
-        try {
-          const writePath = this.metadataStore.data.files[resolution.filePath]?.localPath
-            ?? normalizePath(resolution.filePath);
-          await this.vault.adapter.write(writePath, resolution.content);
-        } catch (err) {
-          throw new Error(
-            `Failed to write conflict resolution for ${resolution.filePath}: ${err instanceof Error ? err.message : String(err)}`,
-            { cause: err },
-          );
-        }
-        // Even though we set the last modified timestamp for all files with conflicts
-        // just before pushing the changes to remote we do it here again because the
-        // write right above would overwrite that.
-        // Since we want to keep the sync timestamp for this file to avoid future conflicts
-        // we update it again.
-        this.metadataStore.data.files[resolution.filePath].lastModified =
-          syncTime;
-      }),
+          try {
+            const writePath = this.metadataStore.data.files[resolution.filePath]?.localPath
+              ?? normalizePath(resolution.filePath);
+            await this.vault.adapter.write(writePath, resolution.content);
+          } catch (err) {
+            throw new Error(
+              `Failed to write conflict resolution for ${resolution.filePath}: ${err instanceof Error ? err.message : String(err)}`,
+              { cause: err },
+            );
+          }
+          // Even though we set the last modified timestamp for all files with conflicts
+          // just before pushing the changes to remote we do it here again because the
+          // write right above would overwrite that.
+          // Since we want to keep the sync timestamp for this file to avoid future conflicts
+          // we update it again.
+          this.metadataStore.data.files[resolution.filePath].lastModified = syncTime;
+        }),
     );
-    // Now that the sync is done and we updated the content for conflicting files
-    // we can save the latest metadata to disk.
-    this.metadataStore.save();
-    await this.logger.info("Sync done");
   }
 
   /**

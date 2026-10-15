@@ -32,6 +32,7 @@ describe("settings", () => {
 
   describe("DEFAULT_SETTINGS", () => {
     it("should have correct default values", () => {
+      expect(DEFAULT_SETTINGS.tombstoneRetentionDays).toBe(30);
       expect(DEFAULT_SETTINGS.firstSync).toBe(true);
       expect(DEFAULT_SETTINGS.githubBranch).toBe("main");
       expect(DEFAULT_SETTINGS.syncStrategy).toBe("manual");

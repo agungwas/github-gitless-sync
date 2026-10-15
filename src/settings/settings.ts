@@ -22,6 +22,8 @@ export interface GitHubSyncSettings {
   enableLogging: boolean;
   syncOnWindowFocus: boolean;
   syncOnWindowBlur: boolean;
+  // Days a deleted-file row stays in sync metadata before it is pruned.
+  tombstoneRetentionDays: number;
 }
 
 export const DEFAULT_SETTINGS: GitHubSyncSettings = {
@@ -46,6 +48,7 @@ export const DEFAULT_SETTINGS: GitHubSyncSettings = {
   enableLogging: false,
   syncOnWindowFocus: false,
   syncOnWindowBlur: false,
+  tombstoneRetentionDays: 30,
 };
 
 const COMMIT_TEMPLATE_KEY = "gitless-commit-message-template";

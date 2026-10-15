@@ -3,6 +3,11 @@ updated: "2026-10-15"
 ---
 # Decisions
 
+## 2026-10-15 — Tombstone Retention Setting
+**Chose:** setting `tombstoneRetentionDays` (default 30); `commitSync()` drops rows that are `deleted`, older than retention, and absent from this vault, for `sync`. **Over:** keeping tombstones forever; anti-resurrection guard (delete_local when local row has sha, remote row gone, content unchanged).
+**Why:** stop unbounded metadata growth; human accepted that a device offline longer than retention may resurrect deleted files.
+**Plan:** ./features/sync/plans/plan-tombstone-retention.md
+
 ## 2026-10-15 — Metadata-Neutral Community Plugin Sync
 **Chose:** revert `github-sync-metadata.json` to pre-feature `{lastSync, files}`; plain tombstones for uninstall; hydrate binaries only on manifest download / missing `main.js`; drop self-update staging, auto-sync triggers, `enabledBase` merge, for `community-plugin-sync`. **Over:** keeping `pluginSource` only; local marker file for self-update; receipts + per-sync hashing; 3-way enabled merge.
 **Why:** human requires zero metadata structure change; stored plugin state was mostly derivable or dead (`configBase`, `repositoryKey`, `baselineCommit`), and Gitless files already travel through git.

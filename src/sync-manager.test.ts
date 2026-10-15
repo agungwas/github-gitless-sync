@@ -674,6 +674,58 @@ describe('SyncManager - Filename Context in Filesystem Error Messages', () => {
       expect(store.data.files['notes/todo.md']).toMatchObject({ dirty: true, lastModified: 99, sha: 'old-sha' });
     });
 
+    it('drops expired tombstones from the manifest and live metadata after commit (T8)', async () => {
+      const old = Date.now() - 31 * 86_400_000;
+      const row: FileMetadata = { path: 'gone.md', sha: null, dirty: false, justDownloaded: false, lastModified: 1, deleted: true, deletedAt: old };
+      const store = { data: { lastSync: 0, files: { 'gone.md': { ...row } } }, save: vi.fn() };
+      (syncManager as any).metadataStore = store;
+      (syncManager as any).settings.tombstoneRetentionDays = 30;
+      (mockVault.adapter.exists as any).mockResolvedValue(false);
+      const treeFiles = { [manifestPath]: { path: manifestPath, mode: '100644', type: 'blob', sha: 'old' } } as any;
+
+      await (syncManager as any).commitSync(treeFiles, 'treeSha', { 'gone.md': { ...row } });
+
+      expect(JSON.parse(treeFiles[manifestPath].content).files['gone.md']).toBeUndefined();
+      expect(store.data.files['gone.md']).toBeUndefined();
+    });
+
+    it('keeps a live row that was recreated during the sync (T9)', async () => {
+      const old = Date.now() - 31 * 86_400_000;
+      const row: FileMetadata = { path: 'gone.md', sha: null, dirty: false, justDownloaded: false, lastModified: 1, deleted: true, deletedAt: old };
+      const store = { data: { lastSync: 0, files: { 'gone.md': { ...row } } }, save: vi.fn() };
+      (syncManager as any).metadataStore = store;
+      (syncManager as any).settings.tombstoneRetentionDays = 30;
+      (mockVault.adapter.exists as any).mockResolvedValue(false);
+      (syncManager as any).client.createTree = vi.fn().mockImplementation(async () => {
+        store.data.files['gone.md'] = { ...row, deleted: false, deletedAt: null, sha: 'new', lastModified: 99 } as FileMetadata;
+        return 'new-tree-sha';
+      });
+      const treeFiles = { [manifestPath]: { path: manifestPath, mode: '100644', type: 'blob', sha: 'old' } } as any;
+
+      await (syncManager as any).commitSync(treeFiles, 'treeSha', { 'gone.md': { ...row } });
+
+      expect(JSON.parse(treeFiles[manifestPath].content).files['gone.md']).toBeUndefined();
+      expect(store.data.files['gone.md']).toMatchObject({ deleted: false, sha: 'new' });
+    });
+
+    it('keeps a newer tombstone written to the live row during the sync (T12)', async () => {
+      const old = Date.now() - 31 * 86_400_000;
+      const row: FileMetadata = { path: 'gone.md', sha: null, dirty: false, justDownloaded: false, lastModified: 1, deleted: true, deletedAt: old };
+      const store = { data: { lastSync: 0, files: { 'gone.md': { ...row } } }, save: vi.fn() };
+      (syncManager as any).metadataStore = store;
+      (syncManager as any).settings.tombstoneRetentionDays = 30;
+      (mockVault.adapter.exists as any).mockResolvedValue(false);
+      (syncManager as any).client.createTree = vi.fn().mockImplementation(async () => {
+        store.data.files['gone.md'] = { ...row, deletedAt: Date.now() };
+        return 'new-tree-sha';
+      });
+      const treeFiles = { [manifestPath]: { path: manifestPath, mode: '100644', type: 'blob', sha: 'old' } } as any;
+
+      await (syncManager as any).commitSync(treeFiles, 'treeSha', { 'gone.md': { ...row } });
+
+      expect(store.data.files['gone.md']).toMatchObject({ deleted: true });
+    });
+
     it('uses pinned snapshot commit as parent instead of fetching a moving branch head', async () => {
       const client = {
         createTree: vi.fn().mockResolvedValue('new-tree-sha'),
@@ -1367,5 +1419,84 @@ describe('SyncManager - Filename Context in Filesystem Error Messages', () => {
         (syncManager as any).getRemoteFileContentWithFallback(filePath, metadataFile, {}),
       ).resolves.toBeNull();
     });
+  });
+});
+
+describe("SyncManager tombstone retention", () => {
+  const DAY = 86_400_000;
+  const NOW = 1_800_000_000_000;
+  const tombstone = (path: string, ageDays: number | null, extra: Partial<FileMetadata> = {}): FileMetadata => ({
+    path, sha: null, dirty: false, justDownloaded: false, lastModified: 1, deleted: true,
+    deletedAt: ageDays === null ? null : NOW - ageDays * DAY, ...extra,
+  });
+  // `onDisk` is what the filesystem lists; `existing` is what a case-insensitive exists() reports.
+  const build = (existing: string[] = [], onDisk: string[] = existing) => {
+    const exists = vi.fn(async (path: string) => existing.includes(path));
+    const dirOf = (p: string) => (p.includes("/") ? p.slice(0, p.lastIndexOf("/")) : "/");
+    const list = vi.fn(async (folder: string) => ({ files: onDisk.filter((p) => dirOf(p) === folder), folders: [] }));
+    const manager = new SyncManager(
+      { configDir: ".obsidian", adapter: { exists, list } } as unknown as Vault,
+      { tombstoneRetentionDays: 30, excludePatterns: [], includePatterns: [] } as unknown as GitHubSyncSettings,
+      vi.fn(),
+      { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as Logger,
+      undefined,
+      "gitless",
+    );
+    return { exists, manager, prune: async (files: Record<string, FileMetadata>) => [...await (manager as unknown as {
+      findExpiredTombstones(files: Record<string, FileMetadata>, now: number): Promise<Map<string, number>>;
+    }).findExpiredTombstones(files, NOW)].map(([path]) => path) };
+  };
+
+  it("returns tombstones older than the retention window whose file is absent (T1)", async () => {
+    const { prune } = build();
+    expect(await prune({ "a.md": tombstone("a.md", 31) })).toEqual(["a.md"]);
+  });
+
+  it("keeps tombstones inside the retention window (T2)", async () => {
+    const { prune } = build();
+    expect(await prune({ "a.md": tombstone("a.md", 29) })).toEqual([]);
+  });
+
+  it("keeps an expired tombstone whose file exists in the vault (T3)", async () => {
+    const { prune } = build(["a.md"]);
+    expect(await prune({ "a.md": tombstone("a.md", 31) })).toEqual([]);
+  });
+
+  it("never prunes rows that are not deleted (T4)", async () => {
+    const { prune } = build();
+    expect(await prune({ "a.md": { ...tombstone("a.md", 31), deleted: false } })).toEqual([]);
+  });
+
+  it("never prunes a tombstone without deletedAt (T5)", async () => {
+    const { prune } = build();
+    expect(await prune({ "a.md": tombstone("a.md", null) })).toEqual([]);
+  });
+
+  it("never prunes the metadata file itself (T6)", async () => {
+    const { prune } = build();
+    const path = ".obsidian/github-sync-metadata.json";
+    expect(await prune({ [path]: tombstone(path, 99) })).toEqual([]);
+  });
+
+  it("prunes nothing when the retention setting is missing or invalid (T11)", async () => {
+    const { prune, manager } = build();
+    (manager as unknown as { settings: Partial<GitHubSyncSettings> }).settings.tombstoneRetentionDays = undefined;
+    expect(await prune({ "a.md": tombstone("a.md", 999) })).toEqual([]);
+  });
+
+  it("prunes when a case-insensitive filesystem only has a differently-cased file (T13)", async () => {
+    const { prune } = build(["notes/A.md"], ["notes/a.md"]);
+    expect(await prune({ "notes/A.md": tombstone("notes/A.md", 31) })).toEqual(["notes/A.md"]);
+  });
+
+  it("keeps the tombstone when the exact-cased file is on disk (T14)", async () => {
+    const { prune } = build(["notes/A.md"], ["notes/A.md"]);
+    expect(await prune({ "notes/A.md": tombstone("notes/A.md", 31) })).toEqual([]);
+  });
+
+  it("checks existence at localPath when present (T7)", async () => {
+    const { prune, exists } = build();
+    await prune({ "remote/a.md": tombstone("remote/a.md", 31, { localPath: "local/a.md" }) });
+    expect(exists).toHaveBeenCalledWith("local/a.md");
   });
 });

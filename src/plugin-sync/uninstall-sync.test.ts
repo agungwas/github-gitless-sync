@@ -109,6 +109,7 @@ async function createAndroidFixture(localModifiedAt: number, nativeSyncEnabled =
     { configDir: ".obsidian", adapter } as unknown as Vault,
     {
       ...DEFAULT_SETTINGS, syncCommunityPlugins: nativeSyncEnabled, syncConfigDir: true,
+      tombstoneRetentionDays: 36_500, // fixture timestamps are synthetic; retention is not under test here
       excludePatterns: [".obsidian/plugins/"],
       includePatterns: [".obsidian/plugins/**/manifest.json", ".obsidian/plugins/**/data.json"],
     },

@@ -1,9 +1,9 @@
 ---
 last_updated: "2026-10-15"
-updated_by_plan: "none (standalone iris-debug fix)"
+updated_by_plan: "plan-tombstone-retention.md"
 active_skill: ""
 active_since: ""
-decision: "2026-07-07 — Guard delete_local Against ENOENT (Already-Absent File)"
+decision: "2026-10-15 — Tombstone Retention Setting"
 ---
 # Sync Feature
 
@@ -16,7 +16,7 @@ decision: "2026-07-07 — Guard delete_local Against ENOENT (Already-Absent File
 | `src/metadata-store.ts` | `MetadataStore` + `FileMetadata`/`Metadata` interfaces |
 | `src/events-listener.ts` | `EventsListener` — tracks vault FS events, updates metadata |
 | `src/github/client.ts` | `GithubClient` — all GitHub REST API calls |
-| `src/settings/settings.ts` | `GitHubSyncSettings` interface + `DEFAULT_SETTINGS` |
+| `src/settings/settings.ts` | `GitHubSyncSettings` interface + `DEFAULT_SETTINGS` (incl. `tombstoneRetentionDays`, default 30) |
 | `src/main.ts` | `GitHubSyncPlugin` — plugin entrypoint, wires everything together |
 
 ## Data Model
@@ -137,15 +137,17 @@ Config dir files filtered out if `syncConfigDir=false` (except manifest).
 
 ### Commit Process (`commitSync()`)
 
-1. Update `metadataStore.data.lastSync = syncTime`
-2. For text files: compute SHA via `calculateSHA()`, store in metadata
-3. For binary files: `createBlob()` → get SHA, remove `content` from tree item (can't have both `sha` and `content`)
-4. Inline manifest JSON as `content` in tree item (replaces any `sha`)
-5. `createTree({ tree, base_tree: treeSha })` → newTreeSha
-6. `getBranchHeadSha()` → branchHeadSha
-7. `buildCommitMessage(template, deviceName)` → message string, then `createCommit({ message, treeSha: newTreeSha, parent: branchHeadSha })` → commitSha
-8. `updateBranchHead({ sha: commitSha })`
-9. Write conflict resolutions to disk
+`commitSync()` is a chain of named steps (all private on `SyncManager`):
+
+1. Set `metadataStore.data.lastSync = syncTime`; capture a copy of the snapshot for the later merge-back
+2. `stampResolvedConflictTimes()` — resolved-conflict files get `lastModified = syncTime` (snapshot only)
+3. `attachShasToTreeFiles()` — text: `calculateSHAFromString()`; binary: `uploadBinaryBlob()` → `createBlob()`, drop `content` from the tree item; both via `recordSnapshotSha()`
+4. `findExpiredTombstones()` + `dropTombstonesFromSnapshot()` — expired tombstones never reach the manifest (see Tombstone Retention)
+5. `writeMetadataIntoTree()` — manifest JSON as `content` (replaces any `sha`), built from the snapshot
+6. `pushCommit()` — `createTree` → `getBranchHeadSha` (unless a pinned commit sha is passed) → `buildCommitMessage` → `createCommit` → `updateBranchHead`
+7. `mergeCommittedSnapshotIntoLive()` — outcome merged into live metadata unless a concurrent event changed that row
+8. `dropTombstonesFromLiveMetadata()` — drops the pruned rows from live metadata (log "Pruned expired tombstones")
+9. `applyResolvedConflictContent()` — write conflict resolutions to disk
 10. Save metadata
 
 **Commit message template** (`gitless-commit-message-template` in `localStorage`, default: `"Sync at {YYYY-MM-DD HH:mm}"`). 
@@ -325,3 +327,18 @@ No `Notice()` call in this codebase carries an icon, emoji, or checkmark prefix 
 2. Any perceived checkmark icon is rendered by the OS/Obsidian mobile shell around the toast, not by this plugin's code — plugin only ever passes plain strings to `new Notice(...)`.
 
 `syncConfigDir` (Config Dir Sync section above) has no code path that touches Notice display — ruled out as a cause of notice-text/icon inconsistency.
+
+## Tombstone Retention
+
+Setting `tombstoneRetentionDays` (default 30, field "Deleted file retention (days)" in the Sync section of the settings tab, minimum 1). During `commitSync()`, `findExpiredTombstones()` selects rows where `deleted === true`, `deletedAt` is a number older than `now - retention`, the path is not the metadata file, and the file is not on disk. `existsWithExactCase()` confirms the exact-cased name via `adapter.list(parent)` after `adapter.exists` hits, because `exists` ignores letter case on macOS/Windows. Selected rows leave the snapshot (so the remote manifest) before it is built; the live row is removed after the commit succeeds, only if it is still the same tombstone (`deletedAt` equal), so a file re-created or re-deleted mid-sync is untouched. If the setting is missing or NaN nothing is pruned.
+
+Other paths that remove metadata rows: `removeVolatileArtifactsFromLocalMetadata()`, `performExcludedMetadataCleanup()` and `removeConfigDirFromMetadata()`.
+
+`deletedAt` is also used for delete-vs-modify ordering in `determineSyncActions()` and for reinstall detection in `reconcileConfigDirFiles()` (`stat.mtime > deletedAt`); both only need it while the file exists or the tombstone is within the window.
+
+**Known constraints**
+- A device offline longer than the retention window still holds the file and a live row. After the remote tombstone is pruned, `determineSyncActions()` sees "local only" and uploads it: the deleted file (or a plugin `manifest.json`) comes back. Accepted; no guard exists.
+- The first sync after upgrade prunes every tombstone older than the window at once.
+- Case-insensitive filesystems cost one extra `list()` per expired tombstone whose path `exists` reports.
+- The days field has no upper clamp (a huge value effectively disables pruning).
+- The settings field rendering in `tab.ts` `display()` is untested (no `Setting` harness); T1–T14 cover the logic.

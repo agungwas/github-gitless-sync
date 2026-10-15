@@ -333,6 +333,24 @@ export default class GitHubSyncSettingsTab extends PluginSettingTab {
       });
 
     new Setting(containerEl)
+      .setName("Deleted file retention (days)")
+      .setDesc(
+        "Deleted files stay in sync metadata this many days, then are forgotten once missing from this vault. A device offline longer than this may restore deleted files.",
+      )
+      .addText((text) =>
+        text
+          .setPlaceholder("Days")
+          .setValue(this.plugin.settings.tombstoneRetentionDays.toString())
+          .onChange(async (value) => {
+            const days = parseInt(value);
+            this.plugin.settings.tombstoneRetentionDays = Number.isNaN(days)
+              ? DEFAULT_SETTINGS.tombstoneRetentionDays
+              : Math.max(days, 1);
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
       .setName("Sync configs")
       .setDesc("Sync Vault config folder with remote repository")
       .addToggle((toggle) => {
