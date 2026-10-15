@@ -7,3 +7,48 @@
     height: 100%;
     width: 100%;
 }
+
+.gitless-logs-content {
+    max-height: 60vh;
+    overflow: auto;
+    user-select: text;
+}
+
+.gitless-logs-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: var(--font-ui-small);
+}
+
+.gitless-logs-table th,
+.gitless-logs-table td {
+    padding: var(--size-4-2);
+    border-bottom: 1px solid var(--background-modifier-border);
+    text-align: left;
+    vertical-align: top;
+}
+
+.gitless-logs-table th {
+    position: sticky;
+    top: 0;
+    background: var(--background-primary);
+}
+
+.gitless-logs-table td:first-child,
+.gitless-logs-table td:nth-child(2) {
+    white-space: nowrap;
+}
+
+.gitless-logs-table td:nth-child(3) {
+    min-width: 12rem;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
+.gitless-logs-table pre {
+    min-width: 12rem;
+    max-width: 28rem;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    font-family: var(--font-monospace);
+}

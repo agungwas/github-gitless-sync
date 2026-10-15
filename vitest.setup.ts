@@ -35,10 +35,12 @@ export const base64ToArrayBuffer = (s: string) => {
 };
 
 export const Notice = vi.fn();
+export const requestUrl = vi.fn();
 export const normalizePath = (path: string) => path;
 export class Plugin {}
 export class ItemView {}
 export const Platform = { isMobile: false };
+export const requireApiVersion = vi.fn(() => true);
 export class WorkspaceLeaf {}
 export class PluginSettingTab {}
 export class TextFileView {}

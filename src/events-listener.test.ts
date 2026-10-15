@@ -110,6 +110,26 @@ describe("EventsListener — edge cases (plan-fix-events-listener-edge-cases)", 
     });
   });
 
+  it("does not turn plugin folder delete events directly into uninstall tombstones", async () => {
+    metadataStore.data.files[".obsidian/plugins/quickadd/manifest.json"] = {
+      path: ".obsidian/plugins/quickadd/manifest.json",
+      sha: "manifest-sha",
+      dirty: false,
+      justDownloaded: false,
+      lastModified: 100,
+    };
+    const managedListener = new EventsListener(
+      makeVault() as any,
+      metadataStore as any,
+      { syncCommunityPlugins: true, syncConfigDir: false, excludePatterns: [], includePatterns: [] } as any,
+      makeLogger() as any,
+    );
+
+    await (managedListener as any).onDelete(makeFolder(".obsidian/plugins/quickadd"));
+
+    expect(metadataStore.data.files[".obsidian/plugins/quickadd/manifest.json"].deleted).not.toBe(true);
+  });
+
   describe("Exclude/include patterns (plan-exclude-patterns)", () => {
     it("isSyncable returns false for a path matching an exclude pattern", () => {
       const excludedListener = new EventsListener(

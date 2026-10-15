@@ -1,4 +1,5 @@
 import {
+  Platform,
   Vault,
   Notice,
   normalizePath,
@@ -10,6 +11,7 @@ import GithubClient, {
   GetTreeResponseItem,
   NewTreeRequestItem,
   RepoContent,
+  RepoSnapshot,
 } from "./github/client";
 import MetadataStore, {
   FileMetadata,
@@ -20,9 +22,12 @@ import EventsListener from "./events-listener";
 import { GitHubSyncSettings, getCommitMessageTemplate } from "./settings/settings";
 import Logger, { LOG_FILE_NAME } from "./logger";
 import { decodeBase64String, hasTextExtension, sanitizePathForLocalFilesystem, pathHasMobileIllegalChars } from "./utils";
+import { classifyPath, PathDecision, PolicyContext } from "./plugin-sync/path-policy";
 import { isExcludedPath } from "./sync-filters";
 import GitHubSyncPlugin from "./main";
 import { BlobReader, Entry, Uint8ArrayWriter, ZipReader } from "@zip.js/zip.js";
+import { PluginManagerRuntime } from "./plugin-sync/runtime-bridge";
+import { PluginSyncCoordinator } from "./plugin-sync/coordinator";
 
 interface SyncAction {
   type: "upload" | "download" | "delete_local" | "delete_remote";
@@ -33,11 +38,13 @@ export interface ConflictFile {
   filePath: string;
   remoteContent: string;
   localContent: string;
+  pluginUninstall?: { pluginId: string; localPaths: string[]; changedPaths: string[] };
 }
 
 export interface ConflictResolution {
   filePath: string;
   content: string;
+  pluginUninstallChoice?: "keep-local" | "accept-uninstall";
 }
 
 type OnConflictsCallback = (
@@ -58,21 +65,44 @@ export default class SyncManager {
   // Tracks an in-flight removeExcludedFromMetadata() call so sync()/firstSync()
   // can wait for it to finish before touching metadataStore.data.files themselves.
   private pendingMetadataCleanup: Promise<void> | null = null;
+  private readonly pluginSyncCoordinator: PluginSyncCoordinator;
 
   constructor(
     private vault: Vault,
     private settings: GitHubSyncSettings,
     private onConflicts: OnConflictsCallback,
     private logger: Logger,
+    credentialProvider?: () => Promise<string | null>,
+    private readonly selfPluginId = "gitless",
+    pluginManager?: PluginManagerRuntime,
   ) {
     this.metadataStore = new MetadataStore(this.vault);
-    this.client = new GithubClient(this.settings, this.logger);
+    this.client = new GithubClient(this.settings, this.logger, credentialProvider);
+    this.pluginSyncCoordinator = new PluginSyncCoordinator({
+      vault: this.vault,
+      metadataStore: this.metadataStore,
+      settings: this.settings,
+      logger: this.logger,
+      selfPluginId,
+      pluginManager,
+      isCustomPlugin: (id) => this.pathDecision(`${this.vault.configDir}/plugins/${id}/manifest.json`).owner === "custom",
+    });
+    this.configurePluginSync();
     this.eventsListener = new EventsListener(
       this.vault,
       this.metadataStore,
       this.settings,
       this.logger,
+      this.selfPluginId,
     );
+  }
+
+  configurePluginSync(): void {
+    this.pluginSyncCoordinator.configure();
+  }
+
+  stopPluginSync(): void {
+    this.pluginSyncCoordinator.stop();
   }
 
   /**
@@ -103,16 +133,16 @@ export default class SyncManager {
     }
 
     this.syncing = true;
-    if (this.pendingMetadataCleanup) {
-      await this.pendingMetadataCleanup;
-    }
     try {
+      if (this.pendingMetadataCleanup) await this.pendingMetadataCleanup;
       await this.firstSyncImpl();
-    } catch (err) {
+      if (this.settings.syncCommunityPlugins) {
+        const snapshot = await this.client.getSnapshot({ metadataPath: `${this.vault.configDir}/${MANIFEST_FILE_NAME}` });
+        await this.pluginSyncCoordinator.reconciler?.reconcile(snapshot.complete, new Set());
+      }
+    } finally {
       this.syncing = false;
-      throw err;
     }
-    this.syncing = false;
   }
 
   private async firstSyncImpl() {
@@ -133,7 +163,6 @@ export default class SyncManager {
       // 404 instead is returned in case there are no files.
       // Either way we can handle both by commiting a new empty manifest.
       if ((err as any).status !== 409 && (err as any).status !== 404) {
-        this.syncing = false;
         throw err;
       }
       // The repository is bare, meaning it has no tree, no commits and no branches
@@ -163,6 +192,16 @@ export default class SyncManager {
       treeSha = res.sha;
     }
 
+    const metadataPath = `${this.vault.configDir}/${MANIFEST_FILE_NAME}`;
+    if (!repositoryIsEmpty && files[metadataPath]) {
+      const snapshot = await this.client.getSnapshot({ metadataPath });
+      if (await this.adoptSharedSnapshot(snapshot)) {
+        await this.logger.info("Adopted cloned vault using shared Gitless metadata", snapshot.commitSha);
+        await this.syncImpl();
+        return;
+      }
+    }
+
     const vaultIsEmpty = await this.vaultIsEmpty();
 
     if (!repositoryIsEmpty && !vaultIsEmpty) {
@@ -181,6 +220,13 @@ export default class SyncManager {
       // In this case too the important step is that the remote manifest is created.
       await this.firstSyncFromRemote(files, treeSha);
     }
+  }
+
+  private async adoptSharedSnapshot(snapshot: RepoSnapshot): Promise<boolean> {
+    if (!snapshot.complete || !snapshot.metadata) return false;
+    this.metadataStore.data = { lastSync: snapshot.metadata.lastSync, files: snapshot.metadata.files };
+    await this.metadataStore.save();
+    return true;
   }
 
   /**
@@ -226,11 +272,7 @@ export default class SyncManager {
         continue;
       }
 
-      if (
-        !this.settings.syncConfigDir &&
-        targetPath.startsWith(this.vault.configDir) &&
-        targetPath !== `${this.vault.configDir}/${MANIFEST_FILE_NAME}`
-      ) {
+      if (targetPath.startsWith(`${this.vault.configDir}/`) && !this.isPathSyncable(targetPath)) {
         await this.logger.info("Skipped config", { targetPath });
         continue;
       }
@@ -266,14 +308,14 @@ export default class SyncManager {
         continue;
       }
 
-      if (isExcludedPath(targetPath, this.settings.excludePatterns, this.settings.includePatterns)) {
+      if (!this.isPathSyncable(targetPath)) {
         await this.logger.info("Skipping excluded file", targetPath);
         continue;
       }
 
       const writer = new Uint8ArrayWriter();
       await entry.getData!(writer);
-      const data = await writer.getData();
+      let data = await writer.getData();
       const dir = targetPath.split("/").splice(0, -1).join("/");
       if (dir !== "") {
         const normalizedDir = normalizePath(dir);
@@ -459,10 +501,8 @@ export default class SyncManager {
 
     const notice = new Notice("Syncing...");
     this.syncing = true;
-    if (this.pendingMetadataCleanup) {
-      await this.pendingMetadataCleanup;
-    }
     try {
+      if (this.pendingMetadataCleanup) await this.pendingMetadataCleanup;
       const removedFromRemoteCount = await this.syncImpl();
       // Shown only if sync doesn't fail
       await this.logger.info("Sync successful");
@@ -476,17 +516,29 @@ export default class SyncManager {
       // Show the error to the user, it's not automatically dismissed to make sure
       // the user sees it.
       new Notice(`Error syncing. ${err}`);
+    } finally {
+      this.syncing = false;
+      notice.hide();
     }
-    this.syncing = false;
-    notice.hide();
   }
 
   private async syncImpl(): Promise<number> {
     await this.logger.info("Starting sync");
     await this.reconcileConfigDirFiles();
-    const { files, sha: treeSha } = await this.client.getRepoContent({
-      retry: true,
-    });
+    let pinnedSnapshot: RepoSnapshot | null = null;
+    let files: Record<string, GetTreeResponseItem>;
+    let treeSha: string;
+    if (this.settings.syncCommunityPlugins) {
+      pinnedSnapshot = await this.client.getSnapshot({
+        metadataPath: `${this.vault.configDir}/${MANIFEST_FILE_NAME}`,
+      });
+      files = pinnedSnapshot.files;
+      treeSha = pinnedSnapshot.treeSha;
+    } else {
+      const repo = await this.client.getRepoContent({ retry: true });
+      files = repo.files;
+      treeSha = repo.sha;
+    }
     const manifest = files[`${this.vault.configDir}/${MANIFEST_FILE_NAME}`];
 
     if (manifest === undefined) {
@@ -504,10 +556,17 @@ export default class SyncManager {
       delete files[`${this.vault.configDir}/${LOG_FILE_NAME}`];
     }
 
-    const blob = await this.client.getBlob({ sha: manifest.sha });
-    const remoteMetadata: Metadata = JSON.parse(
-      decodeBase64String(blob.content),
-    );
+    let remoteMetadata: Metadata;
+    if (pinnedSnapshot) {
+      if (!pinnedSnapshot.metadata) throw new Error("Remote manifest metadata is missing or invalid");
+      remoteMetadata = {
+        lastSync: pinnedSnapshot.metadata.lastSync,
+        files: pinnedSnapshot.metadata.files,
+      };
+    } else {
+      const blob = await this.client.getBlob({ sha: manifest.sha });
+      remoteMetadata = JSON.parse(decodeBase64String(blob.content));
+    }
     await this.removeVolatileArtifactsFromLocalMetadata();
     remoteMetadata.files = this.filterRemoteMetadataFiles(remoteMetadata.files);
     await this.reconcileRemoteMetadataWithTree(remoteMetadata.files, files);
@@ -524,9 +583,14 @@ export default class SyncManager {
     const localSnapshot: { [key: string]: FileMetadata } = Object.fromEntries(
       Object.entries(this.metadataStore.data.files).map(([k, v]) => [k, { ...v }]),
     );
-
     const conflicts = await this.findConflicts(remoteMetadata.files, files);
-    const filteredConflicts = conflicts.filter(c => !migratedOldKeys.has(c.filePath));
+    const pluginUninstallConflicts = this.settings.syncCommunityPlugins
+      ? await this.findPluginUninstallConflicts(remoteMetadata.files, localSnapshot)
+      : [];
+    const filteredConflicts = [
+      ...conflicts.filter(c => !migratedOldKeys.has(c.filePath)),
+      ...pluginUninstallConflicts.filter(c => !conflicts.some((existing) => existing.filePath === c.filePath)),
+    ];
 
     // We treat every resolved conflict as an upload SyncAction, mainly cause
     // the user has complete freedom on the edits they can apply to the conflicting files.
@@ -539,37 +603,102 @@ export default class SyncManager {
     let conflictResolutions: ConflictResolution[] = [];
 
     if (filteredConflicts.length > 0) {
-      await this.logger.warn("Found conflicts", filteredConflicts);
+      await this.logger.warn("Found conflicts", filteredConflicts.map((conflict) => ({
+        filePath: conflict.filePath,
+        pluginUninstall: conflict.pluginUninstall?.pluginId,
+      })));
+      const uninstallConflicts = filteredConflicts.filter((conflict) => conflict.pluginUninstall);
       if (this.settings.conflictHandling === "ask") {
         // Here we block the sync process until the user has resolved all the conflicts
         conflictResolutions = await this.onConflicts(filteredConflicts);
-        conflictActions = conflictResolutions.map(
-          (resolution: ConflictResolution) => {
-            return { type: "upload", filePath: resolution.filePath };
-          },
+      } else {
+        // The user chose a side for every conflict. Ordinary conflicts are solved
+        // by a plain download/upload below, uninstall conflicts by a plugin choice.
+        conflictResolutions = this.resolvePluginUninstallConflicts(
+          uninstallConflicts,
+          this.settings.conflictHandling === "overwriteLocal" ? "accept-uninstall" : "keep-local",
         );
-      } else if (this.settings.conflictHandling === "overwriteLocal") {
-        // The user explicitly wants to always overwrite the local file
-        // in case of conflicts so we just download the remote file to solve it
+        conflictActions = filteredConflicts
+          .filter((conflict) => !conflict.pluginUninstall)
+          .map((conflict: ConflictFile): SyncAction => ({
+            type: this.settings.conflictHandling === "overwriteLocal" ? "download" : "upload",
+            filePath: conflict.filePath,
+          }));
+      }
+      const pluginConflicts = new Map(filteredConflicts
+        .filter((conflict) => conflict.pluginUninstall)
+        .map((conflict) => [conflict.pluginUninstall!.pluginId, conflict] as const));
+      const acceptedUninstalls = new Set<string>();
+      for (const resolution of conflictResolutions) {
+        if (!resolution.pluginUninstallChoice) {
+          conflictActions.push({ type: "upload", filePath: resolution.filePath });
+          continue;
+        }
+        const conflict = [...pluginConflicts.values()].find((item) => item.filePath === resolution.filePath);
+        const details = conflict?.pluginUninstall;
+        if (!details) throw new Error("Plugin uninstall resolution did not match a pending conflict");
+        if (resolution.pluginUninstallChoice === "keep-local") {
+          for (const path of details.localPaths) {
+            conflictActions.push({ type: "upload", filePath: path });
+            const local = localSnapshot[path];
+            if (local) {
+              local.deleted = false;
+              delete local.deletedAt;
+            }
+            const live = this.metadataStore.data.files[path];
+            if (live) {
+              live.deleted = false;
+              delete live.deletedAt;
+            }
+          }
+        } else {
+          acceptedUninstalls.add(details.pluginId);
+          const manifestPath = `${this.vault.configDir}/plugins/${details.pluginId}/manifest.json`;
+          const remote = remoteMetadata.files[manifestPath];
+          for (const path of details.localPaths) {
+            const local = localSnapshot[path] ?? (remoteMetadata.files[path] ? { ...remoteMetadata.files[path]! } : undefined);
+            if (!local) continue;
+            local.deleted = true;
+            local.deletedAt = remote?.deletedAt ?? Date.now();
+            localSnapshot[path] = local;
+            const live = this.metadataStore.data.files[path];
+            if (live) {
+              live.deleted = true;
+              live.deletedAt = local.deletedAt;
+            } else {
+              this.metadataStore.data.files[path] = { ...local };
+            }
+          }
+        }
+      }
+      for (const id of acceptedUninstalls) {
+        const pluginConflict = pluginConflicts.get(id)!;
+        for (const path of pluginConflict.pluginUninstall!.localPaths) {
+          if (!conflictActions.some((action) => action.filePath === path)) {
+            conflictActions.push({ type: "delete_local", filePath: path });
+          }
+        }
+      }
+    }
 
-        // It's not necessary to set conflict resolutions as the content the
-        // user expect must be the content of the remote file with no changes.
-        conflictActions = filteredConflicts.map(
-          (conflict: ConflictFile) => {
-            return { type: "download", filePath: conflict.filePath };
-          },
-        );
-      } else if (this.settings.conflictHandling === "overwriteRemote") {
-        // The user explicitly wants to always overwrite the remote file
-        // in case of conflicts so we just upload the remote file to solve it.
-
-        // It's not necessary to set conflict resolutions as the content the
-        // user expect must be the content of the local file with no changes.
-        conflictActions = filteredConflicts.map(
-          (conflict: ConflictFile) => {
-            return { type: "upload", filePath: conflict.filePath };
-          },
-        );
+    const enabledPath = `${this.vault.configDir}/community-plugins.json`;
+    const remoteEnabledFile = files[enabledPath];
+    if (
+      Platform.isMobile && this.settings.syncCommunityPlugins && remoteEnabledFile &&
+      !filteredConflicts.some((conflict) => conflict.filePath === enabledPath) &&
+      await this.vault.adapter.exists(enabledPath)
+    ) {
+      try {
+        const [localText, remoteBlob] = await Promise.all([
+          this.vault.adapter.read(enabledPath),
+          this.client.getBlob({ sha: remoteEnabledFile.sha, retry: true }),
+        ]);
+        const preserved = await this.preserveDesktopOnlyIds(localText, decodeBase64String(remoteBlob.content));
+        // Written locally first so the uploaded content equals the local file; otherwise
+        // the file would look changed on every following sync.
+        if (preserved !== null) await this.vault.adapter.write(enabledPath, preserved);
+      } catch (error) {
+        await this.logger.warn("Could not preserve desktop-only plugin ids", String(error));
       }
     }
 
@@ -587,6 +716,7 @@ export default class SyncManager {
     if (actions.length === 0) {
       // Nothing to sync
       await this.logger.info("Nothing to sync");
+      if (pinnedSnapshot) await this.pluginSyncCoordinator.reconciler?.reconcile(pinnedSnapshot.complete, new Set());
       return 0;
     }
     await this.logger.info("Actions to sync", actions);
@@ -615,6 +745,13 @@ export default class SyncManager {
             const normalizedPath = normalizePath(action.filePath);
             const localPath = localSnapshot[action.filePath]?.localPath ?? normalizedPath;
             if (!(await this.vault.adapter.exists(localPath))) {
+              if (this.isManagedPluginPath(action.filePath)) {
+                await this.logger.warn(
+                  "Deferred ambiguous plugin removal until explicit uninstall evidence exists",
+                  action.filePath,
+                );
+                break;
+              }
               // File was removed from disk without the delete event being tracked
               // (e.g., a plugin folder deleted via Obsidian UI). Treat as a remote
               // deletion instead so the file is removed from GitHub on next sync.
@@ -659,6 +796,14 @@ export default class SyncManager {
             break;
           }
           case "delete_remote":
+            if (
+              this.isManagedPluginPath(action.filePath) &&
+              !this.hasAcceptedPluginUninstall(action.filePath, localSnapshot) &&
+              !this.isVerifiedPluginBinaryMigration(action.filePath)
+            ) {
+              await this.logger.warn("Blocked plugin deletion without explicit uninstall evidence", action.filePath);
+              break;
+            }
             if (newTreeFiles[action.filePath]) {
               newTreeFiles[action.filePath].sha = null;
             }
@@ -671,45 +816,66 @@ export default class SyncManager {
       }),
     );
 
-    // Download files and delete local files
+    // Download files and delete local files. Gitless's own manifest is written
+    // after the rest so an interrupted sync never leaves a new manifest with an old main.js.
+    const selfManifestPath = `${this.vault.configDir}/plugins/${this.selfPluginId}/manifest.json`;
+    const downloadAction = async (action: SyncAction) => {
+      if (this.isPhantomManifestEntry(files, action.filePath)) {
+        // The manifest lists this path as live but the raw remote tree has no
+        // matching item for it (e.g. a drift-causing race on the device that
+        // committed it). Don't crash — tombstone it in the snapshot so the
+        // manifest this sync commits marks it deleted, converging the remote
+        // state instead of repeating this on every future sync.
+        await this.logger.warn(
+          "Download action skipped: manifest references a file missing from the remote tree",
+          action.filePath,
+        );
+        localSnapshot[action.filePath] = {
+          path: action.filePath,
+          sha: null,
+          dirty: false,
+          justDownloaded: false,
+          lastModified: Date.now(),
+          deleted: true,
+          deletedAt: Date.now(),
+        };
+        return;
+      }
+      await this.downloadFile(
+        files[action.filePath],
+        remoteMetadata.files[action.filePath].lastModified,
+        remoteMetadata.files[action.filePath],
+      );
+    };
     await Promise.all([
       ...actions
-        .filter((action) => action.type === "download")
-        .map(async (action: SyncAction) => {
-          if (this.isPhantomManifestEntry(files, action.filePath)) {
-            // The manifest lists this path as live but the raw remote tree has no
-            // matching item for it (e.g. a drift-causing race on the device that
-            // committed it). Don't crash — tombstone it in the snapshot so the
-            // manifest this sync commits marks it deleted, converging the remote
-            // state instead of repeating this on every future sync.
-            await this.logger.warn(
-              "Download action skipped: manifest references a file missing from the remote tree",
-              action.filePath,
-            );
-            localSnapshot[action.filePath] = {
-              path: action.filePath,
-              sha: null,
-              dirty: false,
-              justDownloaded: false,
-              lastModified: Date.now(),
-              deleted: true,
-              deletedAt: Date.now(),
-            };
-            return;
-          }
-          await this.downloadFile(
-            files[action.filePath],
-            remoteMetadata.files[action.filePath].lastModified,
-          );
-        }),
+        .filter((action) => action.type === "download" && action.filePath !== selfManifestPath)
+        .map(downloadAction),
       ...actions
         .filter((action) => action.type === "delete_local")
         .map(async (action: SyncAction) => {
-          await this.deleteLocalFile(action.filePath);
+          const incomingMetadata = remoteMetadata.files[action.filePath];
+          const tombstone = incomingMetadata?.deleted
+            ? incomingMetadata
+            : localSnapshot[action.filePath]?.deleted ? localSnapshot[action.filePath] : undefined;
+          await this.deleteLocalFile(action.filePath, tombstone);
+          const deletedFile = this.metadataStore.data.files[action.filePath];
+          // The commit uses this snapshot, so deleting only live metadata would republish a live entry.
+          if (deletedFile) localSnapshot[action.filePath] = { ...deletedFile };
         }),
     ]);
 
-    await this.commitSync(newTreeFiles, treeSha, localSnapshot, conflictResolutions);
+    for (const action of actions) {
+      if (action.type === "download" && action.filePath === selfManifestPath) await downloadAction(action);
+    }
+
+    await this.commitSync(newTreeFiles, treeSha, localSnapshot, conflictResolutions, pinnedSnapshot?.commitSha);
+    if (pinnedSnapshot) {
+      await this.pluginSyncCoordinator.reconciler?.reconcile(
+        pinnedSnapshot.complete,
+        this.collectHydrateIds(actions, conflictResolutions),
+      );
+    }
     return excludedRemoteOrphans.length;
   }
 
@@ -732,12 +898,137 @@ export default class SyncManager {
     );
   }
 
+  private pathDecision(filePath: string): PathDecision {
+    const context: PolicyContext = {
+      configDir: this.vault.configDir,
+      syncConfigDir: this.settings.syncConfigDir,
+      syncCommunityPlugins: this.settings.syncCommunityPlugins,
+      excludePatterns: this.settings.excludePatterns,
+      includePatterns: this.settings.includePatterns,
+      selfPluginId: this.selfPluginId,
+    };
+    return classifyPath(filePath, context);
+  }
+
+  private isManagedPluginPath(filePath: string): boolean {
+    const owner = this.pathDecision(filePath).owner;
+    return owner === "managed" || owner === "self";
+  }
+
+
+  /**
+   * Plugin ids whose package files must be re-downloaded: a managed manifest was written
+   * by this sync, either downloaded or settled by a conflict resolution (except an accepted uninstall).
+   */
+  private collectHydrateIds(actions: SyncAction[], resolutions: ConflictResolution[]): Set<string> {
+    const manifestPaths = [
+      ...actions.filter((action) => action.type === "download").map((action) => action.filePath),
+      ...resolutions
+        .filter((resolution) => resolution.pluginUninstallChoice !== "accept-uninstall")
+        .map((resolution) => resolution.filePath),
+    ];
+    const prefix = `${this.vault.configDir}/plugins/`;
+    const ids = new Set<string>();
+    for (const path of manifestPaths) {
+      if (!path.startsWith(prefix) || this.pathDecision(path).owner !== "managed") continue;
+      const [id, name, ...rest] = path.slice(prefix.length).split("/");
+      if (id && name === "manifest.json" && rest.length === 0) ids.add(id);
+    }
+    return ids;
+  }
+
+  private resolvePluginUninstallConflicts(
+    conflicts: ConflictFile[],
+    choice: "accept-uninstall" | "keep-local",
+  ): ConflictResolution[] {
+    // content is ignored for accept-uninstall (shouldApplyConflictContent) and is the unchanged local file for keep-local
+    return conflicts.map((conflict) => ({
+      filePath: conflict.filePath,
+      content: conflict.localContent,
+      pluginUninstallChoice: choice,
+    }));
+  }
+
+  private isPluginDesiredStatePath(filePath: string): boolean {
+    if (filePath === `${this.vault.configDir}/community-plugins.json`) return true;
+    const prefix = `${this.vault.configDir}/plugins/`;
+    if (!filePath.startsWith(prefix)) return false;
+    const parts = filePath.slice(prefix.length).split("/");
+    return parts.length === 2 && ["manifest.json", "data.json"].includes(parts[1] ?? "");
+  }
+
+  private isVerifiedPluginBinaryMigration(filePath: string): boolean {
+    if (!this.settings.syncCommunityPlugins) return false;
+    const prefix = `${this.vault.configDir}/plugins/`;
+    if (!filePath.startsWith(prefix)) return false;
+    const parts = filePath.slice(prefix.length).split("/");
+    if (parts.length !== 2 || !["main.js", "styles.css"].includes(parts[1] ?? "")) return false;
+    return parts[0] !== this.selfPluginId && this.pathDecision(filePath).owner === "managed";
+  }
+
+  private hasAcceptedPluginUninstall(filePath: string, files: Record<string, FileMetadata>): boolean {
+    const prefix = `${this.vault.configDir}/plugins/`;
+    if (!filePath.startsWith(prefix)) return false;
+    const pluginId = filePath.slice(prefix.length).split("/")[0];
+    if (!pluginId || pluginId === this.selfPluginId) return false;
+    const manifest = files[`${prefix}${pluginId}/manifest.json`];
+    return manifest?.deleted === true;
+  }
+
+  private async findPluginUninstallConflicts(
+    remoteFiles: Record<string, FileMetadata>,
+    localFiles: Record<string, FileMetadata>,
+  ): Promise<ConflictFile[]> {
+    const prefix = `${this.vault.configDir}/plugins/`;
+    const conflicts: ConflictFile[] = [];
+    for (const [manifestPath, remoteManifest] of Object.entries(remoteFiles)) {
+      if (!manifestPath.startsWith(prefix) || remoteManifest.deleted !== true) continue;
+      const parts = manifestPath.slice(prefix.length).split("/");
+      if (parts.length !== 2 || parts[1] !== "manifest.json" || parts[0] === this.selfPluginId) continue;
+      const id = parts[0];
+      const localPaths: string[] = [];
+      const changedPaths: string[] = [];
+      let localManifest = "";
+      for (const path of [manifestPath, `${prefix}${id}/data.json`]) {
+        const local = localFiles[path];
+        if (!local || local.deleted) continue;
+        const localPath = local.localPath ?? normalizePath(path);
+        if (!(await this.vault.adapter.exists(localPath))) continue;
+        localPaths.push(path);
+        const actualSha = await this.calculateSHA(path);
+        if (actualSha !== local.sha) {
+          changedPaths.push(path);
+          if (path === manifestPath) localManifest = await this.vault.adapter.read(localPath);
+        }
+      }
+      if (changedPaths.length) {
+        if (!localPaths.includes(manifestPath)) localPaths.unshift(manifestPath);
+        if (!localManifest) {
+          const localPath = localFiles[manifestPath]?.localPath ?? normalizePath(manifestPath);
+          if (await this.vault.adapter.exists(localPath)) localManifest = await this.vault.adapter.read(localPath);
+        }
+        conflicts.push({
+          filePath: manifestPath,
+          remoteContent: "",
+          localContent: localManifest,
+          pluginUninstall: { pluginId: id, localPaths, changedPaths },
+        });
+      }
+    }
+    return conflicts;
+  }
+
   shouldSkipFile(filePath: string): boolean {
     if (filePath === `${this.vault.configDir}/${MANIFEST_FILE_NAME}`) {
       // The manifest must never be treated as excluded, even if a user
       // pattern would otherwise match it.
       return false;
     }
+    const pathDecision = this.pathDecision(filePath);
+    if (pathDecision.owner === "managed" || pathDecision.owner === "self" || pathDecision.owner === "internal") {
+      return pathDecision.transport === "local";
+    }
+    if (pathDecision.owner === "custom") return false;
     return (
       this.isVolatileSyncArtifact(filePath) ||
       isExcludedPath(filePath, this.settings.excludePatterns, this.settings.includePatterns)
@@ -754,6 +1045,9 @@ export default class SyncManager {
     if (filePath === `${this.vault.configDir}/${MANIFEST_FILE_NAME}`) {
       return true;
     }
+    const pathDecision = this.pathDecision(filePath);
+    if (pathDecision.owner !== "ordinary") return pathDecision.transport !== "local";
+    if (pathDecision.transport === "local") return false;
     if (this.shouldSkipFile(filePath)) {
       return false;
     }
@@ -783,7 +1077,14 @@ export default class SyncManager {
   }): SyncAction[] {
     return Object.keys(files)
       .filter((filePath) => filePath !== `${this.vault.configDir}/${MANIFEST_FILE_NAME}`)
-      .filter((filePath) => !this.isPathSyncable(filePath))
+      .filter((filePath) => {
+        const pathDecision = this.pathDecision(filePath);
+        // Desired state stays on the remote regardless of this device's filters, unless the
+        // user opted this exact data.json out on purpose.
+        if (this.isPluginDesiredStatePath(filePath) && !pathDecision.settingsOptOut) return false;
+        const verifiedBinaryMigration = this.isVerifiedPluginBinaryMigration(filePath);
+        return verifiedBinaryMigration || (pathDecision.cleanup !== "binary-migration" && !this.isPathSyncable(filePath));
+      })
       .map((filePath) => ({ type: "delete_remote", filePath }));
   }
 
@@ -837,7 +1138,7 @@ export default class SyncManager {
    * No-op when syncConfigDir is disabled.
    */
   private async reconcileConfigDirFiles(): Promise<void> {
-    if (!this.settings.syncConfigDir) {
+    if (!this.settings.syncConfigDir && !this.settings.syncCommunityPlugins) {
       return;
     }
 
@@ -853,7 +1154,7 @@ export default class SyncManager {
 
     let changed = false;
     for (const filePath of configFiles) {
-      if (this.shouldSkipFile(filePath)) continue;
+      if (!this.isPathSyncable(filePath)) continue;
       if (filePath.split("/").last()?.startsWith(".")) continue;
 
       const existing = this.metadataStore.data.files[filePath];
@@ -1192,6 +1493,12 @@ export default class SyncManager {
 
         const localSHA = await this.calculateSHA(filePath);
 
+        if (this.settings.syncCommunityPlugins && remoteFile.deleted && this.hasAcceptedPluginUninstall(filePath, remoteFiles)) {
+          // Local edits are resolved as package conflicts first; clocks cannot resurrect an unchanged package.
+          actions.push({ type: "delete_local", filePath });
+          return;
+        }
+
         if (remoteFile.deleted && !localFile.deleted) {
           if ((remoteFile.deletedAt as number) > localFile.lastModified) {
             actions.push({
@@ -1284,14 +1591,7 @@ export default class SyncManager {
         // The manifest file is always synced.
         return true;
       }
-      if (isExcludedPath(action.filePath, this.settings.excludePatterns, this.settings.includePatterns)) {
-        return false;
-      }
-      if (!this.settings.syncConfigDir && action.filePath.startsWith(this.vault.configDir)) {
-        // Remove actions that involve the config directory if the user doesn't want to sync it.
-        return false;
-      }
-      return true;
+      return this.isPathSyncable(action.filePath);
     });
   }
 
@@ -1349,7 +1649,11 @@ export default class SyncManager {
     baseTreeSha: string,
     localMetadataSnapshot: { [key: string]: FileMetadata },
     conflictResolutions: ConflictResolution[] = [],
+    baseCommitSha?: string,
   ) {
+    const capturedMetadataSnapshot = Object.fromEntries(
+      Object.entries(localMetadataSnapshot).map(([path, file]) => [path, { ...file }]),
+    );
     // Update local sync time
     const syncTime = Date.now();
     this.metadataStore.data.lastSync = syncTime;
@@ -1364,7 +1668,7 @@ export default class SyncManager {
     // just before pushing to remote.
     // We're going to update the local content when the sync is successful.
     // This targets the snapshot (not live data) since it feeds the manifest content below.
-    conflictResolutions.forEach((resolution) => {
+    conflictResolutions.filter((resolution) => this.shouldApplyConflictContent(resolution)).forEach((resolution) => {
       localMetadataSnapshot[resolution.filePath].lastModified = syncTime;
     });
 
@@ -1454,7 +1758,10 @@ export default class SyncManager {
     // never leak a file reference into the manifest without a matching tree item.
     delete treeFiles[`${this.vault.configDir}/${MANIFEST_FILE_NAME}`].sha;
     treeFiles[`${this.vault.configDir}/${MANIFEST_FILE_NAME}`].content =
-      JSON.stringify({ lastSync: this.metadataStore.data.lastSync, files: localMetadataSnapshot });
+      JSON.stringify({
+        lastSync: this.metadataStore.data.lastSync,
+        files: localMetadataSnapshot,
+      });
 
     // Create the new tree
     const newTree: { tree: NewTreeRequestItem[]; base_tree: string } = {
@@ -1468,7 +1775,7 @@ export default class SyncManager {
       retry: true,
     });
 
-    const branchHeadSha = await this.client.getBranchHeadSha({ retry: true });
+    const branchHeadSha = baseCommitSha ?? await this.client.getBranchHeadSha({ retry: true });
 
     const message = SyncManager.buildCommitMessage(getCommitMessageTemplate());
 
@@ -1480,15 +1787,23 @@ export default class SyncManager {
 
     await this.client.updateBranchHead({ sha: commitSha, retry: true });
 
-    // Merge this sync's outcome (sha updates, tombstones) back into live metadata.
-    // Object.assign only overwrites keys present in the snapshot, so a key added to
-    // live data by a concurrent vault event during this sync (never part of the
-    // snapshot) survives untouched and is picked up on the next sync.
-    Object.assign(this.metadataStore.data.files, localMetadataSnapshot);
+    for (const [path, committedFile] of Object.entries(localMetadataSnapshot)) {
+      const capturedFile = capturedMetadataSnapshot[path];
+      const liveFile = this.metadataStore.data.files[path];
+      if (!capturedFile) {
+        if (!liveFile) this.metadataStore.data.files[path] = committedFile;
+        continue;
+      }
+      if (!liveFile || this.sameMetadataRevision(liveFile, capturedFile)) {
+        this.metadataStore.data.files[path] = committedFile;
+      }
+    }
 
     // Update the local content of all files that had conflicts we resolved
     await Promise.all(
-      conflictResolutions.map(async (resolution) => {
+      conflictResolutions
+        .filter((resolution) => this.shouldApplyConflictContent(resolution))
+        .map(async (resolution) => {
         try {
           const writePath = this.metadataStore.data.files[resolution.filePath]?.localPath
             ?? normalizePath(resolution.filePath);
@@ -1514,7 +1829,65 @@ export default class SyncManager {
     await this.logger.info("Sync done");
   }
 
-  async downloadFile(file: GetTreeResponseItem, lastModified: number) {
+  /**
+   * Obsidian mobile may rewrite community-plugins.json without desktop-only plugin ids.
+   * Returns the local list with those ids restored from the remote list, or null when
+   * nothing has to change.
+   */
+  private async preserveDesktopOnlyIds(localText: string, remoteText: string): Promise<string | null> {
+    const parseIds = (text: string): string[] | null => {
+      try {
+        const value: unknown = JSON.parse(text);
+        return Array.isArray(value) && value.every((id) => typeof id === "string") ? value : null;
+      } catch {
+        return null;
+      }
+    };
+    const localIds = parseIds(localText);
+    const remoteIds = parseIds(remoteText);
+    if (!localIds || !remoteIds) return null;
+    const missing: string[] = [];
+    for (const id of remoteIds) {
+      if (localIds.includes(id)) continue;
+      const manifestPath = `${this.vault.configDir}/plugins/${id}/manifest.json`;
+      try {
+        const manifest = JSON.parse(await this.vault.adapter.read(manifestPath)) as { isDesktopOnly?: boolean };
+        if (manifest.isDesktopOnly === true) missing.push(id);
+      } catch {
+        // No readable manifest: the id is not provably desktop-only, leave it out.
+      }
+    }
+    if (missing.length === 0) return null;
+    return `${JSON.stringify([...localIds, ...missing], null, 2)}\n`;
+  }
+
+  private sameMetadataRevision(left: FileMetadata, right: FileMetadata): boolean {
+    return JSON.stringify({
+      path: left.path,
+      localPath: left.localPath,
+      sha: left.sha,
+      dirty: left.dirty,
+      justDownloaded: left.justDownloaded,
+      lastModified: left.lastModified,
+      deleted: left.deleted,
+      deletedAt: left.deletedAt,
+    }) === JSON.stringify({
+      path: right.path,
+      localPath: right.localPath,
+      sha: right.sha,
+      dirty: right.dirty,
+      justDownloaded: right.justDownloaded,
+      lastModified: right.lastModified,
+      deleted: right.deleted,
+      deletedAt: right.deletedAt,
+    });
+  }
+
+  private shouldApplyConflictContent(resolution: ConflictResolution): boolean {
+    return resolution.pluginUninstallChoice !== "accept-uninstall";
+  }
+
+  async downloadFile(file: GetTreeResponseItem, lastModified: number, remoteMetadata?: FileMetadata) {
     const fileMetadata = this.metadataStore.data.files[file.path];
     if (fileMetadata && fileMetadata.sha === file.sha) {
       return;
@@ -1533,7 +1906,8 @@ export default class SyncManager {
       }
     }
     try {
-      await this.vault.adapter.writeBinary(sanitizedPath, base64ToArrayBuffer(blob.content));
+      const originalBytes = base64ToArrayBuffer(blob.content);
+      await this.vault.adapter.writeBinary(sanitizedPath, originalBytes);
     } catch (err) {
       throw new Error(
         `Failed to write file ${sanitizedPath}: ${err instanceof Error ? err.message : String(err)}`,
@@ -1552,7 +1926,7 @@ export default class SyncManager {
     await this.metadataStore.save();
   }
 
-  async deleteLocalFile(filePath: string) {
+  async deleteLocalFile(filePath: string, incomingTombstone?: FileMetadata) {
     const localPath = this.metadataStore.data.files[filePath]?.localPath ?? normalizePath(filePath);
     if (await this.vault.adapter.exists(localPath)) {
       try {
@@ -1571,11 +1945,18 @@ export default class SyncManager {
         filePath,
       );
     }
-    if (this.metadataStore.data.files[filePath]) {
-      this.metadataStore.data.files[filePath].deleted = true;
-      this.metadataStore.data.files[filePath].deletedAt = Date.now();
+    let deletedMetadata = this.metadataStore.data.files[filePath];
+    if (!deletedMetadata && incomingTombstone) {
+      deletedMetadata = { ...incomingTombstone };
+      this.metadataStore.data.files[filePath] = deletedMetadata;
     }
-    this.metadataStore.save();
+    if (deletedMetadata) {
+      if (incomingTombstone) Object.assign(deletedMetadata, incomingTombstone);
+      deletedMetadata.path = filePath;
+      deletedMetadata.deleted = true;
+      deletedMetadata.deletedAt = incomingTombstone?.deletedAt ?? Date.now();
+    }
+    await this.metadataStore.save();
   }
 
   async loadMetadata() {

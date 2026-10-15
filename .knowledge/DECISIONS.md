@@ -1,7 +1,12 @@
 ---
-updated: "2026-07-07"
+updated: "2026-10-15"
 ---
 # Decisions
+
+## 2026-10-15 — Metadata-Neutral Community Plugin Sync
+**Chose:** revert `github-sync-metadata.json` to pre-feature `{lastSync, files}`; plain tombstones for uninstall; hydrate binaries only on manifest download / missing `main.js`; drop self-update staging, auto-sync triggers, `enabledBase` merge, for `community-plugin-sync`. **Over:** keeping `pluginSource` only; local marker file for self-update; receipts + per-sync hashing; 3-way enabled merge.
+**Why:** human requires zero metadata structure change; stored plugin state was mostly derivable or dead (`configBase`, `repositoryKey`, `baselineCommit`), and Gitless files already travel through git.
+**Plan:** ./features/community-plugin-sync/plans/plan-native-community-plugin-sync.md
 
 ## 2026-07-07 — Guard delete_local Against ENOENT (Already-Absent File)
 **Chose:** Check `adapter.exists()` before `adapter.remove()` in `deleteLocalFile()`; if already absent, log a warn and skip the remove instead of throwing — goal state (file gone) is already achieved. Also guard the metadata-entry write against the entry being missing (same concurrent-mutation race class as the Manifest/Tree Consistency snapshot-freeze fix). **Over:** leaving the hard throw (kills the whole sync's `Promise.all` mid-flight, so already-prepared uploads never reach `commitSync`).

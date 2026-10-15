@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { getCommitMessageTemplate, setCommitMessageTemplate, DEFAULT_SETTINGS } from "./settings";
+import { beforeEach, describe, expect, it } from "vitest";
+import { DEFAULT_SETTINGS, getCommitMessageTemplate, setCommitMessageTemplate } from "./settings";
 
 describe("settings", () => {
   beforeEach(() => {
@@ -43,5 +43,12 @@ describe("settings", () => {
       expect(DEFAULT_SETTINGS.excludePatterns).toEqual([]);
       expect(DEFAULT_SETTINGS.includePatterns).toEqual([]);
     });
+  });
+});
+
+describe("community plugin sync setting", () => {
+  it("defaults plugin sync off independently of general config sync", () => {
+    expect(DEFAULT_SETTINGS.syncConfigDir).toBe(false);
+    expect((DEFAULT_SETTINGS as typeof DEFAULT_SETTINGS & { syncCommunityPlugins?: boolean }).syncCommunityPlugins).toBe(false);
   });
 });

@@ -7,7 +7,7 @@ import {
   Notice,
 } from "obsidian";
 import GitHubSyncPlugin from "src/main";
-import { copyToClipboard } from "src/utils";
+import LogsModal from "./logs-modal";
 import {
   DEFAULT_SETTINGS,
   getCommitMessageTemplate,
@@ -204,8 +204,7 @@ export default class GitHubSyncSettingsTab extends PluginSettingTab {
           .setPlaceholder("Token")
           .setValue(this.plugin.settings.githubToken)
           .onChange(async (value) => {
-            this.plugin.settings.githubToken = value;
-            await this.plugin.saveSettings();
+            await this.plugin.setGitHubToken(value);
           }).inputEl.type = "password";
         tokenInput = text;
       });
@@ -348,6 +347,23 @@ export default class GitHubSyncSettingsTab extends PluginSettingTab {
             }
             await this.plugin.saveSettings();
           });
+      });
+
+    new Setting(containerEl)
+      .setName("Sync community plugins")
+      .setDesc("Sync community plugin choices and settings independently of general config sync. Gitless's complete plugin folder, including its GitHub token, always syncs.")
+      .addToggle((toggle) => {
+        toggle
+          .setValue(this.plugin.settings.syncCommunityPlugins)
+          .onChange(async (enabled) => {
+            try {
+              await this.plugin.setCommunityPluginSyncEnabled(enabled);
+            } catch (error) {
+              toggle.setValue(false);
+              new Notice(`Could not enable community plugin sync: ${String(error)}`);
+            }
+          });
+        if (!this.plugin.canEnableCommunityPluginSync()) toggle.setDisabled(true);
       });
 
     new Setting(containerEl)
@@ -521,26 +537,11 @@ export default class GitHubSyncSettingsTab extends PluginSettingTab {
       });
 
     new Setting(containerEl)
-      .setName("Copy logs")
-      .setDesc("Copy the log file content, this is useful to report bugs.")
+      .setName("View logs")
+      .setDesc("Read the log file in a dialog and copy it when reporting bugs.")
       .addButton((button) => {
-        button.setButtonText("Copy").onClick(async () => {
-          const logs: string = await this.plugin.logger.read();
-          try {
-            await copyToClipboard(logs);
-            new Notice("Logs copied", 5000);
-          } catch (err) {
-            new Notice(`Failed copying logs: ${err}`, 10000);
-          }
-        });
-      });
-
-    new Setting(containerEl)
-      .setName("Clean logs")
-      .setDesc("Delete all existing logs.")
-      .addButton((button) => {
-        button.setButtonText("Clean").onClick(async () => {
-          await this.plugin.logger.clean();
+        button.setButtonText("View logs").onClick(() => {
+          new LogsModal(this.app, () => this.plugin.logger.read(), () => this.plugin.logger.clean()).open();
         });
       });
 

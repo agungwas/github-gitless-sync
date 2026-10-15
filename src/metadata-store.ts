@@ -41,6 +41,33 @@ export interface Metadata {
   files: { [key: string]: FileMetadata };
 }
 
+const FILE_METADATA_KEYS = [
+  "path", "localPath", "sha", "dirty", "justDownloaded", "lastModified", "deleted", "deletedAt",
+] as const;
+
+/**
+ * Reduces parsed metadata to its stable shape: `lastSync` and `files` with the
+ * fields of FileMetadata. Anything else, such as fields written by other
+ * versions, is dropped so it is never copied into local state or re-uploaded.
+ */
+export function normalizeMetadata(value: unknown): Metadata {
+  const record = value as { lastSync?: unknown; files?: unknown } | null;
+  if (typeof record !== "object" || record === null || typeof record.files !== "object" || record.files === null) {
+    throw new Error("Invalid Gitless metadata");
+  }
+  const files: Record<string, FileMetadata> = {};
+  for (const [path, file] of Object.entries(record.files)) {
+    if (typeof file !== "object" || file === null) continue;
+    const source = file as Record<string, unknown>;
+    const kept: Record<string, unknown> = {};
+    for (const key of FILE_METADATA_KEYS) {
+      if (source[key] !== undefined) kept[key] = source[key];
+    }
+    files[path] = kept as unknown as FileMetadata;
+  }
+  return { lastSync: typeof record.lastSync === "number" ? record.lastSync : 0, files };
+}
+
 /**
  * Stores files metadata between sesssions.
  * Data is saved as JSON in the .obsidian folder in the current Vault.
@@ -63,7 +90,7 @@ export default class MetadataStore {
     const fileExists = await this.vault.adapter.exists(this.metadataFile);
     if (fileExists) {
       const content = await this.vault.adapter.read(this.metadataFile);
-      this.data = JSON.parse(content);
+      this.data = normalizeMetadata(JSON.parse(content));
     } else {
       this.data = { lastSync: 0, files: {} };
     }
@@ -73,13 +100,14 @@ export default class MetadataStore {
    * Save current metadata to disk.
    */
   async save() {
-    this.writeQueue = this.writeQueue.then(async () => {
+    const nextWrite = this.writeQueue.catch(() => undefined).then(async () => {
       await this.vault.adapter.write(
         this.metadataFile,
         JSON.stringify(this.data),
       );
     });
-    return this.writeQueue;
+    this.writeQueue = nextWrite;
+    return nextWrite;
   }
 
   reset() {

@@ -3,6 +3,7 @@ import MetadataStore, { MANIFEST_FILE_NAME } from "./metadata-store";
 import { GitHubSyncSettings } from "./settings/settings";
 import Logger, { LOG_FILE_NAME } from "./logger";
 import GitHubSyncPlugin from "./main";
+import { classifyPath } from "./plugin-sync/path-policy";
 import { isExcludedPath } from "./sync-filters";
 
 /**
@@ -14,6 +15,7 @@ export default class EventsListener {
     private metadataStore: MetadataStore,
     private settings: GitHubSyncSettings,
     private logger: Logger,
+    private selfPluginId = "gitless",
   ) {}
 
   start(plugin: GitHubSyncPlugin) {
@@ -64,6 +66,10 @@ export default class EventsListener {
   private async onDelete(file: TAbstractFile | string) {
     const filePath = file instanceof TAbstractFile ? file.path : file;
     await this.logger.info("Received delete event", filePath);
+    if (this.isManagedPluginRemoval(filePath)) {
+      await this.logger.info("Deferred plugin removal until reconciliation", filePath);
+      return;
+    }
     if (file instanceof TFolder) {
       // When a folder is deleted, mark all tracked files inside it as deleted.
       const folderPrefix = filePath + "/";
@@ -179,29 +185,33 @@ export default class EventsListener {
     if (filePath === `${this.vault.configDir}/${MANIFEST_FILE_NAME}`) {
       // Manifest file must always be synced
       return true;
-    } else if (
-      filePath === `${this.vault.configDir}/workspace.json` ||
-      filePath === `${this.vault.configDir}/workspace-mobile.json`
-    ) {
-      // Obsidian recommends not syncing the workspace files
-      return false;
-    } else if (filePath === `${this.vault.configDir}/${LOG_FILE_NAME}`) {
-      // Don't sync the log file, doesn't make sense
-      return false;
-    } else if (
-      isExcludedPath(filePath, this.settings.excludePatterns, this.settings.includePatterns)
-    ) {
-      // User-configured exclude pattern, not overridden by an include pattern
-      return false;
-    } else if (
-      this.settings.syncConfigDir &&
-      filePath.startsWith(this.vault.configDir)
-    ) {
-      // Sync configs only if the user explicitly wants to
-      return true;
-    } else {
-      // All other files can be synced
+    }
+    if (!this.settings.syncCommunityPlugins) {
+      if (
+        filePath === `${this.vault.configDir}/workspace.json` ||
+        filePath === `${this.vault.configDir}/workspace-mobile.json` ||
+        filePath === `${this.vault.configDir}/${LOG_FILE_NAME}`
+      ) return false;
+      if (isExcludedPath(filePath, this.settings.excludePatterns, this.settings.includePatterns)) return false;
       return true;
     }
+    const pathDecision = classifyPath(filePath, {
+      configDir: this.vault.configDir,
+      syncConfigDir: this.settings.syncConfigDir,
+      syncCommunityPlugins: this.settings.syncCommunityPlugins,
+      excludePatterns: this.settings.excludePatterns,
+      includePatterns: this.settings.includePatterns,
+      selfPluginId: this.selfPluginId,
+    });
+    return pathDecision.transport !== "local";
+  }
+
+  private isManagedPluginRemoval(filePath: string): boolean {
+    if (!this.settings.syncCommunityPlugins) return false;
+    const pluginPrefix = `${this.vault.configDir}/plugins/`;
+    if (!filePath.startsWith(pluginPrefix)) return false;
+    const segments = filePath.slice(pluginPrefix.length).split("/");
+    if (segments[0] === this.selfPluginId) return false;
+    return segments.length === 1 || (segments.length === 2 && segments[1] === "manifest.json");
   }
 }

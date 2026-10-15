@@ -237,3 +237,59 @@ describe('GitHubSyncPlugin - sync', () => {
     expect(mockSyncManager.sync).toHaveBeenCalled();
   });
 });
+
+describe('GitHubSyncPlugin - community plugin sync settings', () => {
+  it('keeps shared GitHub token in plugin settings when enabling plugin sync', async () => {
+    const secrets = new Map<string, string>();
+    const mockApp = {
+      plugins: { plugins: {}, enablePlugin: vi.fn(), disablePlugin: vi.fn() },
+      secretStorage: {
+        getSecret: vi.fn((key: string) => secrets.get(key) ?? null),
+        setSecret: vi.fn((key: string, value: string) => { secrets.set(key, value); }),
+      },
+    };
+    const plugin = new GitHubSyncPlugin(mockApp as any, { id: 'github-gitless-sync' } as any);
+    plugin.app = mockApp as any;
+    plugin.settings = {
+      ...(await import('./settings/settings')).DEFAULT_SETTINGS,
+      githubOwner: 'owner',
+      githubRepo: 'vault',
+      githubBranch: 'main',
+      githubToken: 'private-canary-token',
+      syncCommunityPlugins: false,
+    };
+    plugin.saveSettings = vi.fn();
+
+    const enablePluginSync = (plugin as unknown as Record<string, unknown>).setCommunityPluginSyncEnabled;
+    expect(enablePluginSync).toBeTypeOf('function');
+    await (enablePluginSync as (enabled: boolean) => Promise<void>).call(plugin, true);
+
+    expect(plugin.settings.githubToken).toBe('private-canary-token');
+    expect(plugin.settings.syncCommunityPlugins).toBe(true);
+    expect(secrets.size).toBe(0);
+    expect(plugin.saveSettings).toHaveBeenCalledOnce();
+  });
+
+  it('saves replacement token in shared plugin settings', async () => {
+    const mockApp = {
+      plugins: { plugins: {}, enablePlugin: vi.fn(), disablePlugin: vi.fn() },
+    };
+    const plugin = new GitHubSyncPlugin(mockApp as any, { id: 'github-gitless-sync' } as any);
+    plugin.app = mockApp as any;
+    plugin.settings = {
+      ...(await import('./settings/settings')).DEFAULT_SETTINGS,
+      githubOwner: 'owner',
+      githubRepo: 'vault',
+      githubBranch: 'main',
+      syncCommunityPlugins: true,
+    };
+    plugin.saveSettings = vi.fn();
+
+    const setToken = (plugin as unknown as Record<string, unknown>).setGitHubToken;
+    expect(setToken).toBeTypeOf('function');
+    await (setToken as (token: string) => Promise<void>).call(plugin, 'replacement-secret');
+
+    expect(plugin.settings.githubToken).toBe('replacement-secret');
+    expect(plugin.saveSettings).toHaveBeenCalledOnce();
+  });
+});

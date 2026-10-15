@@ -8,6 +8,7 @@ export interface GitHubSyncSettings {
   syncInterval: number;
   syncOnStartup: boolean;
   syncConfigDir: boolean;
+  syncCommunityPlugins: boolean;
   excludePatterns: string[];
   includePatterns: string[];
   conflictHandling: "overwriteLocal" | "ask" | "overwriteRemote";
@@ -33,6 +34,7 @@ export const DEFAULT_SETTINGS: GitHubSyncSettings = {
   syncInterval: 1,
   syncOnStartup: false,
   syncConfigDir: false,
+  syncCommunityPlugins: false,
   excludePatterns: [],
   includePatterns: [],
   conflictHandling: "ask",

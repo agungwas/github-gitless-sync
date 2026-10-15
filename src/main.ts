@@ -58,7 +58,7 @@ export default class GitHubSyncPlugin extends Plugin {
 
   async onUserEnable() {
     if (
-      this.settings.githubToken === "" ||
+      !(await this.getGithubToken()) ||
       this.settings.githubOwner === "" ||
       this.settings.githubRepo === "" ||
       this.settings.githubBranch === ""
@@ -96,6 +96,7 @@ export default class GitHubSyncPlugin extends Plugin {
 
   async onload() {
     await this.loadSettings();
+    delete (this.settings as GitHubSyncSettings & { credentialKey?: string }).credentialKey;
 
     this.logger = new Logger(this.app.vault, this.settings.enableLogging);
     this.logger.init();
@@ -112,6 +113,13 @@ export default class GitHubSyncPlugin extends Plugin {
       this.settings,
       this.onConflicts.bind(this),
       this.logger,
+      this.getGithubToken.bind(this),
+      this.manifest.id,
+      (this.app as unknown as { plugins: {
+        plugins: Record<string, unknown>;
+        enablePlugin?: (id: string) => Promise<void>;
+        disablePlugin?: (id: string) => Promise<void>;
+      } }).plugins,
     );
     await this.syncManager.loadMetadata();
 
@@ -190,7 +198,7 @@ export default class GitHubSyncPlugin extends Plugin {
     await Promise.all(savePromises);
 
     if (
-      this.settings.githubToken === "" ||
+      !(await this.getGithubToken()) ||
       this.settings.githubOwner === "" ||
       this.settings.githubRepo === "" ||
       this.settings.githubBranch === ""
@@ -222,6 +230,7 @@ export default class GitHubSyncPlugin extends Plugin {
     this.isUnloading = true;
     this.hidePendingConflictsNotice();
     this.stopSyncInterval();
+    this.syncManager?.stopPluginSync();
   }
 
   showStatusBarItem() {
@@ -428,6 +437,36 @@ export default class GitHubSyncPlugin extends Plugin {
 
   async loadSettings() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+  }
+
+  canEnableCommunityPluginSync(): boolean {
+    const pluginManager = (this.app as unknown as { plugins?: { enablePlugin?: unknown; disablePlugin?: unknown } }).plugins;
+    return (
+      typeof pluginManager?.enablePlugin === "function" &&
+      typeof pluginManager?.disablePlugin === "function"
+    );
+  }
+
+  async setCommunityPluginSyncEnabled(enabled: boolean): Promise<void> {
+    if (!enabled) {
+      this.settings.syncCommunityPlugins = false;
+      this.syncManager?.configurePluginSync();
+      await this.saveSettings();
+      return;
+    }
+    if (!this.canEnableCommunityPluginSync()) throw new Error("Obsidian plugin lifecycle APIs are unavailable");
+    this.settings.syncCommunityPlugins = true;
+    this.syncManager?.configurePluginSync();
+    await this.saveSettings();
+  }
+
+  async setGitHubToken(token: string): Promise<void> {
+    this.settings.githubToken = token;
+    await this.saveSettings();
+  }
+
+  private async getGithubToken(): Promise<string | null> {
+    return this.settings.githubToken || null;
   }
 
   async saveSettings() {

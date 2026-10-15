@@ -6,6 +6,7 @@ import {
   NoConflictsScreen,
   ResetAllBar,
 } from "../resolution-screens";
+import PluginUninstallConflict from "../plugin-uninstall-conflict";
 
 const UnifiedView = ({
   initialFiles,
@@ -26,13 +27,14 @@ const UnifiedView = ({
 }) => {
   const [files, setFiles] = React.useState(initialFiles);
 
-  const onConflictResolved = (fileIndex: number, content: string) => {
+  const onConflictResolved = (fileIndex: number, content: string, pluginUninstallChoice?: "keep-local" | "accept-uninstall") => {
     // Remove the file from the conflicts to resolve
     setFiles(files.filter((_, index) => index !== fileIndex));
     // Keep track of the resolved conflict
     onFileResolved({
       filePath: files[fileIndex].filePath,
       content,
+      ...(pluginUninstallChoice ? { pluginUninstallChoice } : {}),
     });
   };
 
@@ -59,13 +61,19 @@ const UnifiedView = ({
         >
           {file.filePath}
         </div>
-        <DiffView
+        {file.pluginUninstall ? (
+          <PluginUninstallConflict
+            pluginId={file.pluginUninstall.pluginId}
+            localPaths={file.pluginUninstall.changedPaths}
+            onResolve={(choice) => onConflictResolved(index, file.localContent, choice)}
+          />
+        ) : <DiffView
           initialRemoteText={file.remoteContent || ""}
           initialLocalText={file.localContent || ""}
           onConflictResolved={(content: string) => {
             onConflictResolved(index, content);
           }}
-        />
+        />}
       </div>
     );
   };

@@ -7,6 +7,7 @@ import {
   NoConflictsScreen,
   ResetAllBar,
 } from "../resolution-screens";
+import PluginUninstallConflict from "../plugin-uninstall-conflict";
 
 const SplitView = ({
   initialFiles,
@@ -29,7 +30,7 @@ const SplitView = ({
   const [currentFileIndex, setCurrentFileIndex] = React.useState(0);
   const currentFile = files.at(currentFileIndex);
 
-  const onConflictResolved = () => {
+  const onConflictResolved = (pluginUninstallChoice?: "keep-local" | "accept-uninstall") => {
     // Remove the file from the conflicts to resolve
     const remainingFiles = files.filter(
       (_, index) => index !== currentFileIndex,
@@ -39,6 +40,7 @@ const SplitView = ({
     onFileResolved({
       filePath: currentFile!.filePath,
       content: currentFile!.localContent,
+      ...(pluginUninstallChoice ? { pluginUninstallChoice } : {}),
     });
     // Select the previous file only if we're not already at the start
     if (currentFileIndex > 0) {
@@ -85,7 +87,13 @@ const SplitView = ({
             flex: 1,
           }}
         >
-          <DiffView
+          {currentFile?.pluginUninstall ? (
+            <PluginUninstallConflict
+              pluginId={currentFile.pluginUninstall.pluginId}
+              localPaths={currentFile.pluginUninstall.changedPaths}
+              onResolve={onConflictResolved}
+            />
+          ) : <DiffView
             remoteText={currentFile?.remoteContent || ""}
             localText={currentFile?.localContent || ""}
             onRemoteTextChange={(content: string) => {
@@ -99,7 +107,7 @@ const SplitView = ({
               setFiles(tempFiles);
             }}
             onConflictResolved={onConflictResolved}
-          />
+          />}
         </div>
       </div>
     </React.StrictMode>

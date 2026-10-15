@@ -4,6 +4,7 @@ import { Vault, Notice } from 'obsidian';
 import { GitHubSyncSettings } from './settings/settings';
 import Logger from './logger';
 import { GetTreeResponseItem } from './github/client';
+import { FileMetadata } from './metadata-store';
 
 let mockZipEntries: Array<{ filename: string; directory: boolean; getData?: (writer: any) => Promise<void> }> = [];
 vi.mock('@zip.js/zip.js', () => ({
@@ -86,6 +87,297 @@ describe('SyncManager - Sync in Progress Notice', () => {
   });
 });
 
+describe("SyncManager community plugin path policy", () => {
+  it("shares managed plugin intent and self package with config sync on, but keeps ordinary binaries local", () => {
+    const syncManager = new SyncManager(
+      { configDir: ".obsidian" } as unknown as Vault,
+      {
+        githubToken: "token",
+        githubOwner: "owner",
+        githubRepo: "vault",
+        githubBranch: "main",
+        syncConfigDir: true,
+        syncCommunityPlugins: true,
+        excludePatterns: [".obsidian/plugins/"],
+        includePatterns: [".obsidian/plugins/gitless/"],
+      } as GitHubSyncSettings,
+      vi.fn(),
+      { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as Logger,
+      undefined,
+      "gitless",
+    );
+    const isPathSyncable = (syncManager as unknown as { isPathSyncable(path: string): boolean }).isPathSyncable.bind(syncManager);
+
+    expect(isPathSyncable(".obsidian/community-plugins.json")).toBe(true);
+    expect(isPathSyncable(".obsidian/plugins/quickadd/manifest.json")).toBe(true);
+    expect(isPathSyncable(".obsidian/plugins/quickadd/data.json")).toBe(true);
+    expect(isPathSyncable(".obsidian/plugins/quickadd/main.js")).toBe(false);
+    expect(isPathSyncable(".obsidian/plugins/gitless/main.js")).toBe(true);
+  });
+
+  it("accepts plugin deletion only for a deleted manifest tombstone and never for Gitless", () => {
+    const manager = new SyncManager(
+      { configDir: ".obsidian" } as unknown as Vault,
+      { syncCommunityPlugins: true, syncConfigDir: false, excludePatterns: [], includePatterns: [] } as unknown as GitHubSyncSettings,
+      vi.fn(),
+      { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as Logger,
+      undefined,
+      "gitless",
+    );
+    const internals = manager as unknown as {
+      isManagedPluginPath(path: string): boolean;
+      hasAcceptedPluginUninstall(path: string, files: Record<string, FileMetadata>): boolean;
+    };
+    const manifestPath = ".obsidian/plugins/quickadd/manifest.json";
+
+    expect(internals.isManagedPluginPath(manifestPath)).toBe(true);
+    expect(internals.hasAcceptedPluginUninstall(manifestPath, {})).toBe(false);
+    expect(internals.hasAcceptedPluginUninstall(manifestPath, {
+      [manifestPath]: {
+        path: manifestPath,
+        sha: "old-sha",
+        dirty: false,
+        justDownloaded: false,
+        lastModified: 1,
+        deleted: true,
+      },
+    })).toBe(true);
+    expect(internals.isManagedPluginPath(".obsidian/plugins/gitless/manifest.json")).toBe(true);
+    expect(internals.hasAcceptedPluginUninstall(".obsidian/plugins/gitless/manifest.json", {
+      ".obsidian/plugins/gitless/manifest.json": {
+        path: ".obsidian/plugins/gitless/manifest.json",
+        sha: "old-sha",
+        dirty: false,
+        justDownloaded: false,
+        lastModified: 1,
+        deleted: true,
+      },
+    })).toBe(false);
+  });
+
+  it("removes remote binaries of managed plugins but never the desired-state files or Gitless", () => {
+    const manager = new SyncManager(
+      { configDir: ".obsidian" } as unknown as Vault,
+      { syncCommunityPlugins: true, syncConfigDir: true, includePatterns: [], excludePatterns: [] } as unknown as GitHubSyncSettings,
+      vi.fn(), { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as Logger,
+    );
+    const mainPath = ".obsidian/plugins/quickadd/main.js";
+    const stylesPath = ".obsidian/plugins/quickadd/styles.css";
+    const selfPath = ".obsidian/plugins/gitless/main.js";
+    const manifestPath = ".obsidian/plugins/quickadd/manifest.json";
+    const tree = Object.fromEntries([mainPath, stylesPath, selfPath, manifestPath].map((path) => [path, { path } as GetTreeResponseItem]));
+    const cleanup = (manager as unknown as {
+      computeExcludedRemoteOrphans(tree: Record<string, GetTreeResponseItem>): unknown[];
+    }).computeExcludedRemoteOrphans.bind(manager);
+
+    expect(cleanup(tree)).toEqual([
+      { type: "delete_remote", filePath: mainPath },
+      { type: "delete_remote", filePath: stylesPath },
+    ]);
+  });
+
+  it("keeps plugin desired-state files on the remote when plugin sync is off (T15)", () => {
+    const manager = new SyncManager(
+      { configDir: ".obsidian" } as unknown as Vault,
+      {
+        syncCommunityPlugins: false,
+        syncConfigDir: false,
+        excludePatterns: [],
+        includePatterns: [],
+      } as unknown as GitHubSyncSettings,
+      vi.fn(),
+      { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as Logger,
+    );
+    const cleanup = (manager as unknown as {
+      computeExcludedRemoteOrphans(files: Record<string, GetTreeResponseItem>): Array<{ filePath: string }>;
+    }).computeExcludedRemoteOrphans.bind(manager);
+    const tree = Object.fromEntries([
+      ".obsidian/plugins/quickadd/manifest.json",
+      ".obsidian/plugins/quickadd/data.json",
+      ".obsidian/community-plugins.json",
+      ".obsidian/plugins/quickadd/main.js",
+    ].map((path) => [path, { path } as GetTreeResponseItem]));
+
+    expect(cleanup(tree)).toEqual([{ type: "delete_remote", filePath: ".obsidian/plugins/quickadd/main.js" }]);
+  });
+
+  it("removes the remote data.json the user opted out exactly, but keeps its manifest (T20)", () => {
+    const dataPath = ".obsidian/plugins/quickadd/data.json";
+    const manifestPath = ".obsidian/plugins/quickadd/manifest.json";
+    const manager = new SyncManager(
+      { configDir: ".obsidian" } as unknown as Vault,
+      {
+        syncCommunityPlugins: true,
+        syncConfigDir: true,
+        excludePatterns: [dataPath],
+        includePatterns: [],
+      } as unknown as GitHubSyncSettings,
+      vi.fn(),
+      { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as Logger,
+    );
+    const cleanup = (manager as unknown as {
+      computeExcludedRemoteOrphans(files: Record<string, GetTreeResponseItem>): Array<{ filePath: string }>;
+    }).computeExcludedRemoteOrphans.bind(manager);
+    const tree = Object.fromEntries([dataPath, manifestPath].map((path) => [path, { path } as GetTreeResponseItem]));
+
+    expect(cleanup(tree)).toEqual([{ type: "delete_remote", filePath: dataPath }]);
+  });
+
+  it("adopts cloned vault metadata as plain lastSync and files", async () => {
+    const store = {
+      data: { lastSync: 1, files: {} as Record<string, FileMetadata> },
+      save: vi.fn(async () => undefined),
+    };
+    const manager = new SyncManager(
+      { configDir: ".obsidian" } as unknown as Vault,
+      { githubOwner: "owner", githubRepo: "vault", githubBranch: "main" } as unknown as GitHubSyncSettings,
+      vi.fn(),
+      { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as Logger,
+    );
+    (manager as unknown as { metadataStore: unknown }).metadataStore = store;
+    const adopt = (manager as unknown as { adoptSharedSnapshot(snapshot: unknown): Promise<boolean> }).adoptSharedSnapshot.bind(manager);
+
+    await expect(adopt({ complete: true, commitSha: "pinned-commit", metadata: { lastSync: 2, files: {} } }))
+      .resolves.toBe(true);
+
+    expect(Object.keys(store.data).sort()).toEqual(["files", "lastSync"]);
+    expect(store.data.lastSync).toBe(2);
+  });
+
+  it("collects hydrate ids from downloaded manifests and settled manifest conflicts, not accepted uninstalls (T16)", () => {
+    const manager = new SyncManager(
+      { configDir: ".obsidian" } as unknown as Vault,
+      { syncCommunityPlugins: true, syncConfigDir: true, excludePatterns: [], includePatterns: [".obsidian/plugins/custom/"] } as unknown as GitHubSyncSettings,
+      vi.fn(),
+      { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as Logger,
+      undefined,
+      "gitless",
+    );
+    const collect = (manager as unknown as {
+      collectHydrateIds(actions: Array<{ type: string; filePath: string }>, resolutions: Array<{ filePath: string; content: string; pluginUninstallChoice?: string }>): Set<string>;
+    }).collectHydrateIds.bind(manager);
+
+    const ids = collect(
+      [
+        { type: "download", filePath: ".obsidian/plugins/a/manifest.json" },
+        { type: "download", filePath: ".obsidian/plugins/a/data.json" },
+        { type: "upload", filePath: ".obsidian/plugins/b/manifest.json" },
+        { type: "download", filePath: ".obsidian/plugins/custom/manifest.json" },
+        { type: "download", filePath: ".obsidian/plugins/gitless/manifest.json" },
+      ],
+      [
+        { filePath: ".obsidian/plugins/c/manifest.json", content: "{}" },
+        { filePath: ".obsidian/plugins/d/manifest.json", content: "{}", pluginUninstallChoice: "keep-local" },
+        { filePath: ".obsidian/plugins/e/manifest.json", content: "{}", pluginUninstallChoice: "accept-uninstall" },
+      ],
+    );
+
+    expect([...ids].sort()).toEqual(["a", "c", "d"]);
+  });
+
+  it("restores desktop-only ids a mobile rewrite dropped, and nothing else (T12)", async () => {
+    const adapter = {
+      read: vi.fn(async (path: string) => JSON.stringify({ isDesktopOnly: path.includes("/desktop/") })),
+    };
+    const manager = new SyncManager(
+      { configDir: ".obsidian", adapter } as unknown as Vault,
+      { syncCommunityPlugins: true } as unknown as GitHubSyncSettings,
+      vi.fn(),
+      { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as Logger,
+    );
+    const preserve = (manager as unknown as {
+      preserveDesktopOnlyIds(local: string, remote: string): Promise<string | null>;
+    }).preserveDesktopOnlyIds.bind(manager);
+
+    const result = await preserve('["a"]', '["a","desktop","other"]');
+
+    expect(JSON.parse(result!)).toEqual(["a", "desktop"]);
+    expect(await preserve('["a","desktop"]', '["a","desktop"]')).toBeNull();
+    expect(await preserve("not json", '["desktop"]')).toBeNull();
+  });
+
+  it("shares Gitless settings only when config sync is on", () => {
+    const build = (syncConfigDir: boolean) => new SyncManager(
+      { configDir: ".obsidian" } as unknown as Vault,
+      { syncCommunityPlugins: true, syncConfigDir, excludePatterns: [], includePatterns: [] } as unknown as GitHubSyncSettings,
+      vi.fn(),
+      { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as Logger,
+      undefined,
+      "gitless",
+    );
+    expect(build(true).shouldSkipFile(".obsidian/plugins/gitless/data.json")).toBe(false);
+    expect(build(false).shouldSkipFile(".obsidian/plugins/gitless/data.json")).toBe(true);
+  });
+
+  it("surfaces local plugin edits against an explicit uninstall as a typed UI conflict", async () => {
+    const manifestPath = ".obsidian/plugins/quickadd/manifest.json";
+    const settingsPath = ".obsidian/plugins/quickadd/data.json";
+    const manifestText = '{"id":"quickadd","version":"1.0.0"}';
+    const settingsText = '{"changed":true}';
+    const bytes = new Map([
+      [manifestPath, new TextEncoder().encode(manifestText).buffer as ArrayBuffer],
+      [settingsPath, new TextEncoder().encode(settingsText).buffer as ArrayBuffer],
+    ]);
+    const manager = new SyncManager(
+      { configDir: ".obsidian", adapter: {
+        exists: vi.fn(async (path: string) => bytes.has(path)),
+        readBinary: vi.fn(async (path: string) => bytes.get(path)!),
+        read: vi.fn(async (path: string) => path === manifestPath ? manifestText : settingsText),
+      } } as unknown as Vault,
+      { syncCommunityPlugins: true, syncConfigDir: false, excludePatterns: [], includePatterns: [] } as unknown as GitHubSyncSettings,
+      vi.fn(),
+      { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as Logger,
+      undefined,
+      "gitless",
+    );
+    const base = { dirty: false, justDownloaded: false, lastModified: 1, sha: "base-sha" };
+    const localFiles = {
+      [manifestPath]: { ...base, path: manifestPath },
+      [settingsPath]: { ...base, path: settingsPath },
+    };
+    (manager as unknown as { metadataStore: { data: { files: typeof localFiles } } }).metadataStore.data = { files: localFiles };
+    const remoteFiles = {
+      [manifestPath]: {
+        ...base, path: manifestPath, deleted: true, deletedAt: 2,
+      },
+    };
+    const findConflicts = (manager as unknown as {
+      findPluginUninstallConflicts(remote: typeof remoteFiles, local: typeof localFiles): Promise<unknown[]>;
+    }).findPluginUninstallConflicts.bind(manager);
+
+    await expect(findConflicts(remoteFiles, localFiles)).resolves.toMatchObject([{
+      filePath: manifestPath,
+      pluginUninstall: { pluginId: "quickadd", localPaths: [manifestPath, settingsPath] },
+    }]);
+  });
+
+  it("does not write accepted uninstall conflict content back after local deletion", () => {
+    const manager = new SyncManager(
+      { configDir: ".obsidian" } as unknown as Vault,
+      { syncCommunityPlugins: true, syncConfigDir: false } as unknown as GitHubSyncSettings,
+      vi.fn(),
+      { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as Logger,
+    );
+    const shouldApply = (manager as unknown as {
+      shouldApplyConflictContent(resolution: { filePath: string; content: string; pluginUninstallChoice?: string }): boolean;
+    }).shouldApplyConflictContent.bind(manager);
+
+    expect(shouldApply({ filePath: ".obsidian/plugins/quickadd/manifest.json", content: "{}", pluginUninstallChoice: "accept-uninstall" })).toBe(false);
+    expect(shouldApply({ filePath: ".obsidian/plugins/quickadd/manifest.json", content: "{}", pluginUninstallChoice: "keep-local" })).toBe(true);
+    expect(shouldApply({ filePath: "notes.md", content: "resolved" })).toBe(true);
+  });
+});
+
+async function testGitBlobSha(content: string): Promise<string> {
+  const bytes = new TextEncoder().encode(content);
+  const header = new TextEncoder().encode(`blob ${bytes.length}\0`);
+  const input = new Uint8Array(header.length + bytes.length);
+  input.set(header);
+  input.set(bytes, header.length);
+  const hash = await crypto.subtle.digest("SHA-1", input);
+  return Array.from(new Uint8Array(hash)).map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
 describe('SyncManager - Filename Context in Filesystem Error Messages', () => {
   let syncManager: SyncManager;
   let mockVault: Vault;
@@ -150,6 +442,17 @@ describe('SyncManager - Filename Context in Filesystem Error Messages', () => {
       (syncManager as any).client = {
         getBlob: vi.fn().mockResolvedValue({ content: 'dGVzdA==' }),
       };
+    });
+
+    it('writes Gitless own package files like any ordinary file', async () => {
+      (mockVault.adapter.exists as ReturnType<typeof vi.fn>).mockResolvedValue(true);
+      (mockVault.adapter.writeBinary as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+      const selfFile = { ...mockFile, path: '.obsidian/plugins/gitless/main.js' };
+      await syncManager.downloadFile(selfFile, 1);
+      expect(mockVault.adapter.writeBinary).toHaveBeenCalledWith(
+        '.obsidian/plugins/gitless/main.js',
+        expect.anything(),
+      );
     });
 
     it('includes folder path in error when mkdir fails', async () => {
@@ -342,6 +645,54 @@ describe('SyncManager - Filename Context in Filesystem Error Messages', () => {
       expect((syncManager as any).metadataStore.data.files['live-only.md']).toEqual({
         path: 'live-only.md', sha: null, dirty: true, justDownloaded: false, lastModified: 0,
       });
+    });
+
+    it('preserves a concurrent edit to an existing tracked key after commit', async () => {
+      const file = { path: 'notes/todo.md', sha: 'old-sha', dirty: false, justDownloaded: false, lastModified: 1 };
+      const store = {
+        data: { lastSync: 0, files: { 'notes/todo.md': { ...file } } },
+        save: vi.fn(),
+      };
+      (syncManager as any).metadataStore = store;
+      (syncManager as any).client = {
+        createTree: vi.fn().mockImplementation(async () => {
+          store.data.files['notes/todo.md'].dirty = true;
+          store.data.files['notes/todo.md'].lastModified = 99;
+          return 'new-tree-sha';
+        }),
+        getBranchHeadSha: vi.fn().mockResolvedValue('branch-head-sha'),
+        createCommit: vi.fn().mockResolvedValue('commit-sha'),
+        updateBranchHead: vi.fn().mockResolvedValue(undefined),
+      };
+      const snapshot = { 'notes/todo.md': { ...file } };
+      const treeFiles = {
+        [manifestPath]: { path: manifestPath, mode: '100644', type: 'blob', sha: 'old-manifest-sha' },
+      } as any;
+
+      await (syncManager as any).commitSync(treeFiles, 'treeSha', snapshot);
+
+      expect(store.data.files['notes/todo.md']).toMatchObject({ dirty: true, lastModified: 99, sha: 'old-sha' });
+    });
+
+    it('uses pinned snapshot commit as parent instead of fetching a moving branch head', async () => {
+      const client = {
+        createTree: vi.fn().mockResolvedValue('new-tree-sha'),
+        getBranchHeadSha: vi.fn().mockResolvedValue('moving-head'),
+        createCommit: vi.fn().mockResolvedValue('commit-sha'),
+        updateBranchHead: vi.fn().mockResolvedValue(undefined),
+      };
+      (syncManager as any).client = client;
+      (syncManager as any).metadataStore = { data: { lastSync: 0, files: {} }, save: vi.fn() };
+      await (syncManager as any).commitSync(
+        { [manifestPath]: { path: manifestPath, mode: '100644', type: 'blob', sha: 'old' } },
+        'snapshot-tree',
+        {},
+        [],
+        'snapshot-commit',
+      );
+
+      expect(client.getBranchHeadSha).not.toHaveBeenCalled();
+      expect(client.createCommit).toHaveBeenCalledWith(expect.objectContaining({ parent: 'snapshot-commit' }));
     });
   });
 
@@ -692,6 +1043,19 @@ describe('SyncManager - Filename Context in Filesystem Error Messages', () => {
       };
 
       expect(computeExcludedRemoteOrphans(files)).toEqual([]);
+    });
+
+    it('preserves plugin desired-state files but orphans binaries when this device has plugin sync off', () => {
+      (syncManager as any).settings = { ...mockSettings, syncConfigDir: false, syncCommunityPlugins: false, excludePatterns: [], includePatterns: [] };
+      const computeExcludedRemoteOrphans = (syncManager as any).computeExcludedRemoteOrphans.bind(syncManager);
+      const files = {
+        '.obsidian/plugins/foo/manifest.json': { path: '.obsidian/plugins/foo/manifest.json', sha: 'manifest-sha' },
+        '.obsidian/plugins/foo/main.js': { path: '.obsidian/plugins/foo/main.js', sha: 'binary-sha' },
+      };
+
+      expect(computeExcludedRemoteOrphans(files)).toEqual([
+        { type: 'delete_remote', filePath: '.obsidian/plugins/foo/main.js' },
+      ]);
     });
 
     it('orphans a dot-prefixed configDir file even when syncConfigDir is on', () => {

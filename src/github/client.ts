@@ -2,11 +2,25 @@ import { requestUrl } from "obsidian";
 import Logger from "src/logger";
 import { GitHubSyncSettings } from "src/settings/settings";
 import { retryUntil } from "src/utils";
+import { decodeBase64String } from "src/utils";
+import { Metadata, normalizeMetadata } from "../metadata-store";
 
 export type RepoContent = {
   files: { [key: string]: GetTreeResponseItem };
   sha: string;
 };
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+export interface RepoSnapshot {
+  commitSha: string;
+  treeSha: string;
+  files: Record<string, GetTreeResponseItem>;
+  complete: true;
+  metadata: Metadata | null;
+}
 
 /**
  * Represents a single item in a tree response from the GitHub API.
@@ -63,12 +77,16 @@ export default class GithubClient {
   constructor(
     private settings: GitHubSyncSettings,
     private logger: Logger,
+    private readonly credentialProvider?: () => Promise<string | null>,
   ) {}
 
-  headers() {
+  async headers() {
+    const token = this.credentialProvider
+      ? await this.credentialProvider()
+      : this.settings.githubToken;
     return {
       Accept: "application/vnd.github+json",
-      Authorization: `Bearer ${this.settings.githubToken}`,
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
       "X-GitHub-Api-Version": "2022-11-28",
     };
   }
@@ -88,7 +106,7 @@ export default class GithubClient {
       async () => {
         return requestUrl({
           url: `https://api.github.com/repos/${this.settings.githubOwner}/${this.settings.githubRepo}/git/trees/${this.settings.githubBranch}?recursive=1`,
-          headers: this.headers(),
+          headers: await this.headers(),
           throw: false,
         });
       },
@@ -116,6 +134,71 @@ export default class GithubClient {
     return { files, sha: response.json.sha };
   }
 
+  async getSnapshot({ metadataPath }: { metadataPath: string }): Promise<RepoSnapshot> {
+    const repositoryApi = `https://api.github.com/repos/${this.settings.githubOwner}/${this.settings.githubRepo}`;
+    const branchRef = await this.getJson(`${repositoryApi}/git/refs/heads/${encodeURIComponent(this.settings.githubBranch)}`);
+    const branchObject = branchRef.object;
+    const commitSha = isRecord(branchObject) ? branchObject.sha : undefined;
+    if (typeof commitSha !== "string") throw new Error("GitHub branch response did not include a commit SHA");
+
+    const commit = await this.getJson(`${repositoryApi}/git/commits/${encodeURIComponent(commitSha)}`);
+    const commitTree = commit.tree;
+    const treeSha = isRecord(commitTree) ? commitTree.sha : undefined;
+    if (typeof treeSha !== "string") throw new Error("GitHub commit response did not include a tree SHA");
+
+    const recursiveTree = await this.getJson(`${repositoryApi}/git/trees/${encodeURIComponent(treeSha)}?recursive=1`);
+    const recursiveEntries = recursiveTree.tree;
+    const treeEntries = recursiveTree.truncated === true
+      ? await this.walkTree(repositoryApi, treeSha)
+      : recursiveEntries;
+    if (!Array.isArray(treeEntries)) throw new Error("GitHub tree response is incomplete");
+
+    const files = Object.fromEntries(
+      treeEntries
+        .filter((entry: GetTreeResponseItem) => entry.type === "blob")
+        .map((entry: GetTreeResponseItem) => [entry.path, entry]),
+    ) as Record<string, GetTreeResponseItem>;
+    const metadataTreeEntry = files[metadataPath];
+    let metadata: Metadata | null = null;
+    if (metadataTreeEntry) {
+      const metadataBlob = await this.getBlob({ sha: metadataTreeEntry.sha });
+      metadata = normalizeMetadata(JSON.parse(decodeBase64String(metadataBlob.content)));
+    }
+
+    return { commitSha, treeSha, files, complete: true, metadata };
+  }
+
+  private async getJson(url: string): Promise<Record<string, unknown>> {
+    const response = await requestUrl({ url, headers: await this.headers(), throw: false });
+    if (response.status < 200 || response.status >= 300) {
+      throw new GithubAPIError(response.status, `GitHub snapshot request failed, status ${response.status}`);
+    }
+    if (!isRecord(response.json)) throw new Error("GitHub returned an invalid JSON object");
+    return response.json;
+  }
+
+  private async walkTree(repositoryApi: string, rootTreeSha: string): Promise<GetTreeResponseItem[]> {
+    const pendingTrees: Array<{ sha: string; prefix: string }> = [{ sha: rootTreeSha, prefix: "" }];
+    const files: GetTreeResponseItem[] = [];
+    while (pendingTrees.length > 0) {
+      const currentTree = pendingTrees.shift();
+      if (!currentTree) continue;
+      const tree = await this.getJson(`${repositoryApi}/git/trees/${encodeURIComponent(currentTree.sha)}`);
+      if (tree.truncated === true || !Array.isArray(tree.tree)) {
+        throw new Error("GitHub subtree response is incomplete; plugin deletion is unsafe");
+      }
+      for (const entry of tree.tree as GetTreeResponseItem[]) {
+        const path = currentTree.prefix ? `${currentTree.prefix}/${entry.path}` : entry.path;
+        if (entry.type === "tree") {
+          pendingTrees.push({ sha: entry.sha, prefix: path });
+        } else if (entry.type === "blob") {
+          files.push({ ...entry, path });
+        }
+      }
+    }
+    return files;
+  }
+
   /**
    * Creates a new tree in the GitHub repository.
    *
@@ -137,7 +220,7 @@ export default class GithubClient {
       async () => {
         return requestUrl({
           url: `https://api.github.com/repos/${this.settings.githubOwner}/${this.settings.githubRepo}/git/trees`,
-          headers: this.headers(),
+          headers: await this.headers(),
           method: "POST",
           body: JSON.stringify(tree),
           throw: false,
@@ -184,7 +267,7 @@ export default class GithubClient {
       async () => {
         return requestUrl({
           url: `https://api.github.com/repos/${this.settings.githubOwner}/${this.settings.githubRepo}/git/commits`,
-          headers: this.headers(),
+          headers: await this.headers(),
           method: "POST",
           body: JSON.stringify({
             message: message,
@@ -220,7 +303,7 @@ export default class GithubClient {
       async () => {
         return requestUrl({
           url: `https://api.github.com/repos/${this.settings.githubOwner}/${this.settings.githubRepo}/git/refs/heads/${this.settings.githubBranch}`,
-          headers: this.headers(),
+          headers: await this.headers(),
           throw: false,
         });
       },
@@ -258,10 +341,11 @@ export default class GithubClient {
       async () => {
         return requestUrl({
           url: `https://api.github.com/repos/${this.settings.githubOwner}/${this.settings.githubRepo}/git/refs/heads/${this.settings.githubBranch}`,
-          headers: this.headers(),
+          headers: await this.headers(),
           method: "PATCH",
           body: JSON.stringify({
             sha: sha,
+            force: false,
           }),
           throw: false,
         });
@@ -303,7 +387,7 @@ export default class GithubClient {
       async () => {
         return requestUrl({
           url: `https://api.github.com/repos/${this.settings.githubOwner}/${this.settings.githubRepo}/git/blobs`,
-          headers: this.headers(),
+          headers: await this.headers(),
           method: "POST",
           body: JSON.stringify({ content, encoding }),
           throw: false,
@@ -346,7 +430,7 @@ export default class GithubClient {
       async () => {
         return requestUrl({
           url: `https://api.github.com/repos/${this.settings.githubOwner}/${this.settings.githubRepo}/git/blobs/${sha}`,
-          headers: this.headers(),
+          headers: await this.headers(),
           throw: false,
         });
       },
@@ -390,7 +474,7 @@ export default class GithubClient {
       async () => {
         return requestUrl({
           url: `https://api.github.com/repos/${this.settings.githubOwner}/${this.settings.githubRepo}/contents/${path}`,
-          headers: this.headers(),
+          headers: await this.headers(),
           method: "PUT",
           body: JSON.stringify({
             message: message,
@@ -423,12 +507,13 @@ export default class GithubClient {
   async downloadRepositoryArchive({
     retry = false,
     maxRetries = 5,
+    ref = this.settings.githubBranch,
   } = {}): Promise<ArrayBuffer> {
     const response = await retryUntil(
       async () => {
         return requestUrl({
-          url: `https://api.github.com/repos/${this.settings.githubOwner}/${this.settings.githubRepo}/zipball/${this.settings.githubBranch}`,
-          headers: this.headers(),
+          url: `https://api.github.com/repos/${this.settings.githubOwner}/${this.settings.githubRepo}/zipball/${encodeURIComponent(ref)}`,
+          headers: await this.headers(),
           method: "GET",
           throw: false,
         });
