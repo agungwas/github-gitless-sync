@@ -167,6 +167,55 @@ export class PluginLifecycleReconciler {
     await this.reporter.log("removal-scan", report);
   }
 
+  private async readEnabledIds(): Promise<Set<string>> {
+    const path = `${this.configDir}/community-plugins.json`;
+    try {
+      const value: unknown = JSON.parse(await this.vault.adapter.read(path));
+      if (!Array.isArray(value) || value.some((id) => typeof id !== "string")) throw new Error("invalid enabled-plugin list");
+      return new Set(value);
+    } catch (cause) {
+      throw new Error(`Failed to read enabled plugin list at ${path}`, { cause });
+    }
+  }
+
+  private async updateSavedStateIfUnchanged(id: string, wasEnabled: boolean, desiredEnabled: boolean): Promise<void> {
+    const currentIds = await this.readEnabledIds();
+    const currentSaved = this.runtime.savedEnabledIds();
+    if (!currentSaved) throw new Error("Obsidian enabled plugin state unavailable");
+    if (currentIds.has(id) !== desiredEnabled || currentSaved.has(id) !== wasEnabled) {
+      throw new PluginMutationChangedError(`Plugin state changed during reconciliation: ${id}`);
+    }
+    this.runtime.setSavedEnabled(id, desiredEnabled);
+  }
+
+  private async synchronizeSavedEnabledState(
+    desiredIds: ReadonlySet<string>,
+    savedIds: ReadonlySet<string>,
+    report: PluginSyncReport,
+  ): Promise<boolean> {
+    let changed = false;
+    for (const id of new Set([...savedIds, ...desiredIds])) {
+      const wasEnabled = savedIds.has(id);
+      const desiredEnabled = desiredIds.has(id);
+      if (id === this.selfPluginId || wasEnabled === desiredEnabled) continue;
+      const version = this.runtime.mutationVersion(id);
+      if (this.runtime.isMutating(id)) {
+        report.skipped.push(`${id}: native package mutation in progress`);
+        continue;
+      }
+      try {
+        const completed = await withStableMutation(this.runtime, id, version, async () => {
+          await this.updateSavedStateIfUnchanged(id, wasEnabled, desiredEnabled);
+          changed = true;
+        });
+        if (!completed) report.skipped.push(`${id}: plugin state changed during reconciliation`);
+      } catch (error) {
+        report.failed.push(`${id}: saved state update failed: ${formatError(error)}`);
+      }
+    }
+    return changed;
+  }
+
   async reconcile(completeSnapshot: boolean, hydrateIds: ReadonlySet<string>): Promise<PluginSyncReport> {
     const report = EMPTY_REPORT();
     await this.logger.info("Community plugin reconciliation started", { completeSnapshot });
@@ -177,12 +226,15 @@ export class PluginLifecycleReconciler {
     }
     let enabledIds: Set<string>;
     try {
-      const enabledPath = `${this.configDir}/community-plugins.json`;
-      const enabled = JSON.parse(await this.vault.adapter.read(enabledPath));
-      if (!Array.isArray(enabled) || enabled.some((id) => typeof id !== "string")) throw new Error("invalid enabled-plugin list");
-      enabledIds = new Set(enabled);
+      enabledIds = await this.readEnabledIds();
     } catch (error) {
       report.failed.push(`${this.configDir}/community-plugins.json: enabled state unavailable: ${formatError(error)}`);
+      await this.reporter.log("reconciliation", report);
+      return report;
+    }
+    const savedEnabledIds = this.runtime.savedEnabledIds();
+    if (!savedEnabledIds) {
+      report.failed.push("Obsidian enabled plugin state unavailable");
       await this.reporter.log("reconciliation", report);
       return report;
     }
@@ -195,26 +247,7 @@ export class PluginLifecycleReconciler {
       return report;
     }
     await this.installer.cleanupStaging();
-    for (const id of this.knownLocalIds) {
-      if (id !== this.selfPluginId && !enabledIds.has(id) && this.runtime.isLoaded(id)) {
-        const mutationVersion = this.runtime.mutationVersion(id);
-        if (this.runtime.isMutating(id)) {
-          report.skipped.push(`${id}: native package mutation in progress`);
-          continue;
-        }
-        try {
-          const completed = await withStableMutation(this.runtime, id, mutationVersion, () => this.installer.unloadPlugin(id, report));
-          if (!completed) {
-            report.skipped.push(`${id}: native package changed during reconciliation`);
-            continue;
-          }
-          report.disabled.push(id);
-        } catch (error) {
-          const message = `${id}: disable failed: ${formatError(error)}`;
-          report.failed.push(message);
-        }
-      }
-    }
+    let restartRequired = await this.synchronizeSavedEnabledState(enabledIds, savedEnabledIds, report);
     for (const [manifestPath, metadata] of Object.entries(this.metadataStore.data.files)) {
       const manifestPrefix = `${this.pluginRoot}/`;
       const segments = manifestPath.startsWith(manifestPrefix) ? manifestPath.slice(manifestPrefix.length).split("/") : [];
@@ -267,14 +300,6 @@ export class PluginLifecycleReconciler {
         if (this.isCustomPlugin(id)) {
           if (!(await this.vault.adapter.exists(`${folder}/main.js`))) {
             report.skipped.push(`${id}: custom package files unavailable`);
-          } else if (desiredEnabled && !loaded) {
-            const completed = await withStableMutation(this.runtime, id, mutationVersion, () => this.installer.enablePlugin(id, report));
-            if (completed) report.enabled.push(id);
-            else report.skipped.push(`${id}: native package changed during reconciliation`);
-          } else if (!desiredEnabled && loaded) {
-            const completed = await withStableMutation(this.runtime, id, mutationVersion, () => this.installer.unloadPlugin(id, report));
-            if (completed) report.disabled.push(id);
-            else report.skipped.push(`${id}: native package changed during reconciliation`);
           }
           continue;
         }
@@ -298,20 +323,19 @@ export class PluginLifecycleReconciler {
           if (packageFiles) {
             try {
               await this.installer.install(id, folder, manifestText, packageFiles, mainPath, stylesPath, report);
+              await this.runtime.refreshManifests();
+              this.pendingHydrate.delete(id);
             } catch (error) {
               this.pendingHydrate.add(id);
               throw error;
             }
-            this.pendingHydrate.delete(id);
           }
           const loadedAfterInstall = this.runtime.isLoaded(id);
-          if (desiredEnabled && !loadedAfterInstall) {
+          if (packageFiles && loaded && !loadedAfterInstall) {
             await this.installer.enablePlugin(id, report);
             report.enabled.push(id);
-          } else if (!desiredEnabled && loadedAfterInstall) {
-            await this.installer.unloadPlugin(id, report);
-            report.disabled.push(id);
           }
+          if (packageFiles && desiredEnabled && !loaded) restartRequired = true;
         });
         if (!completed) {
           report.skipped.push(`${id}: native package changed during reconciliation`);
@@ -329,6 +353,10 @@ export class PluginLifecycleReconciler {
 
     await this.reporter.log("reconciliation", report);
     this.reporter.notifyReconciliation(report);
+    if (restartRequired) {
+      await this.logger.info("Community plugin state will take effect after restart");
+      this.reporter.notifyRestartRequired();
+    }
     return report;
   }
 

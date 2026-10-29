@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { PluginLifecycleReconciler } from "./reconciler";
 import { PluginRuntimeBridge } from "./runtime-bridge";
 import { FileMetadata } from "../metadata-store";
+import { Notice } from "obsidian";
 
 const MANIFEST_PATH = ".obsidian/plugins/quickadd/manifest.json";
 const PLUGIN_FOLDER = ".obsidian/plugins/quickadd";
@@ -14,6 +15,7 @@ interface HarnessOptions {
   files?: Record<string, string>;
   enabled?: boolean;
   loaded?: boolean;
+  savedEnabled?: boolean;
   isCustom?: boolean;
   resolve?: () => Promise<unknown>;
   metadataFiles?: Record<string, FileMetadata>;
@@ -48,6 +50,7 @@ function harness(options: HarnessOptions = {}) {
   };
   const manager = {
     plugins: options.loaded ? { quickadd: {} } : {} as Record<string, unknown>,
+    enabledPlugins: new Set((options.savedEnabled ?? (options.enabled !== false)) ? ["quickadd"] : []),
     enablePlugin: vi.fn(async (id: string) => { manager.plugins[id] = {}; }),
     disablePlugin: vi.fn(async (id: string) => { delete manager.plugins[id]; }),
     installPlugin: vi.fn(async (_id: string) => undefined),
@@ -71,7 +74,83 @@ function harness(options: HarnessOptions = {}) {
 }
 
 describe("PluginLifecycleReconciler", () => {
-  it("hydrates a plugin whose manifest was downloaded by this sync and enables it (T4)", async () => {
+  it("leaves a running delayed plugin alone when its saved state is unchanged", async () => {
+    const { reconciler, manager } = harness({ enabled: false, loaded: true, files: { [MAIN_PATH]: "local main" } });
+    const report = await reconciler.reconcile(true, new Set());
+    expect(manager.disablePlugin).not.toHaveBeenCalled();
+    expect(report.disabled).toEqual([]);
+  });
+
+  it("defers a remote disable until restart while updating saved state", async () => {
+    const { reconciler, manager } = harness({ enabled: false, savedEnabled: true, loaded: true, files: { [MAIN_PATH]: "local main" } });
+    const report = await reconciler.reconcile(true, new Set());
+    expect(manager.disablePlugin).not.toHaveBeenCalled();
+    expect(manager.enabledPlugins.has("quickadd")).toBe(false);
+    expect(report.disabled).toEqual([]);
+  });
+
+  it("defers a remote enable until restart while updating saved state", async () => {
+    const { reconciler, manager } = harness({ enabled: true, savedEnabled: false, files: { [MAIN_PATH]: "local main" } });
+    const report = await reconciler.reconcile(true, new Set());
+    expect(manager.enablePlugin).not.toHaveBeenCalled();
+    expect(manager.enabledPlugins.has("quickadd")).toBe(true);
+    expect(report.enabled).toEqual([]);
+  });
+
+  it("notifies once when synced state changes and does not notify again when unchanged", async () => {
+    vi.mocked(Notice).mockClear();
+    const { reconciler } = harness({ enabled: true, savedEnabled: false, files: { [MAIN_PATH]: "local main" } });
+    await reconciler.reconcile(true, new Set());
+    await reconciler.reconcile(true, new Set());
+    expect(Notice).toHaveBeenCalledTimes(1);
+    expect(Notice).toHaveBeenCalledWith("Restart Obsidian to apply synced community plugin state.");
+  });
+
+  it("preserves a newer file change while reconciling saved state", async () => {
+    const { reconciler, adapter, manager } = harness({ enabled: true, savedEnabled: false, files: { [MAIN_PATH]: "local main" } });
+    let reads = 0;
+    adapter.read.mockImplementation(async (path: string) => {
+      if (!path.endsWith("community-plugins.json")) return JSON.stringify(MANIFEST);
+      return ++reads === 1 ? '["quickadd"]' : "[]";
+    });
+    await reconciler.reconcile(true, new Set());
+    expect(manager.enabledPlugins.has("quickadd")).toBe(false);
+    expect(manager.enablePlugin).not.toHaveBeenCalled();
+  });
+
+  it("reports the path and underlying error when the state recheck fails", async () => {
+    const { reconciler, adapter, manager } = harness({ enabled: true, savedEnabled: false, files: { [MAIN_PATH]: "local main" } });
+    let reads = 0;
+    adapter.read.mockImplementation(async (path: string) => {
+      if (!path.endsWith("community-plugins.json")) return JSON.stringify(MANIFEST);
+      if (++reads === 1) return '["quickadd"]';
+      throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+    });
+    const report = await reconciler.reconcile(true, new Set());
+    expect(report.failed.join(" ")).toContain(".obsidian/community-plugins.json");
+    expect(report.failed.join(" ")).toContain("EACCES");
+    expect(manager.enabledPlugins.has("quickadd")).toBe(false);
+  });
+
+  it("restores a running delayed plugin after its package is updated", async () => {
+    const { reconciler, manager } = harness({ enabled: false, loaded: true, files: { [MAIN_PATH]: "old main" } });
+    const report = await reconciler.reconcile(true, new Set(["quickadd"]));
+    expect(manager.disablePlugin).toHaveBeenCalledWith("quickadd");
+    expect(manager.enablePlugin).toHaveBeenCalledWith("quickadd");
+    expect(manager.enabledPlugins.has("quickadd")).toBe(false);
+    expect(report.failed).toEqual([]);
+  });
+
+  it("keeps a running plugin active after an update even if disable is pending", async () => {
+    const { reconciler, manager } = harness({ enabled: false, savedEnabled: true, loaded: true, files: { [MAIN_PATH]: "old main" } });
+    const report = await reconciler.reconcile(true, new Set(["quickadd"]));
+    expect(manager.disablePlugin).toHaveBeenCalledTimes(1);
+    expect(manager.enablePlugin).toHaveBeenCalledTimes(1);
+    expect(manager.enabledPlugins.has("quickadd")).toBe(false);
+    expect(report.updated).toEqual(["quickadd"]);
+  });
+
+  it("hydrates an inactive plugin without enabling it until restart (T4)", async () => {
     const { reconciler, source, files, manager } = harness({ files: { [MAIN_PATH]: "old main" } });
 
     const report = await reconciler.reconcile(true, new Set(["quickadd"]));
@@ -79,7 +158,7 @@ describe("PluginLifecycleReconciler", () => {
     expect(source.resolve).toHaveBeenCalledWith(MANIFEST);
     expect(new TextDecoder().decode(files.get(MAIN_PATH))).toBe("release main");
     expect(new TextDecoder().decode(files.get(STYLES_PATH))).toBe("release css");
-    expect(manager.enablePlugin).toHaveBeenCalledWith("quickadd");
+    expect(manager.enablePlugin).not.toHaveBeenCalled();
     expect(report.updated).toEqual(["quickadd"]);
     expect(report.failed).toEqual([]);
   });
@@ -98,13 +177,12 @@ describe("PluginLifecycleReconciler", () => {
   });
 
   it("hydrates when main.js is missing although the manifest is unchanged (T6)", async () => {
-    const { reconciler, source, report } = await (async () => {
-      const h = harness();
-      return { ...h, report: await h.reconciler.reconcile(true, new Set()) };
-    })();
+    const { reconciler, source, manager } = harness();
+    const report = await reconciler.reconcile(true, new Set());
 
     expect(source.resolve).toHaveBeenCalledOnce();
     expect(report.installed).toEqual(["quickadd"]);
+    expect(manager.enablePlugin).not.toHaveBeenCalled();
   });
 
   it("keeps the old binary on a failed hydrate and retries it in the same session (T5)", async () => {
@@ -143,12 +221,12 @@ describe("PluginLifecycleReconciler", () => {
   });
 
   it("never resolves a custom directory plugin through the registry (T14)", async () => {
-    const { reconciler, source, manager, adapter } = harness({ isCustom: true, files: { [MAIN_PATH]: "custom fork" } });
+    const { reconciler, source, manager, adapter } = harness({ isCustom: true, savedEnabled: false, files: { [MAIN_PATH]: "custom fork" } });
 
     const report = await reconciler.reconcile(true, new Set(["quickadd"]));
 
     expect(source.resolve).not.toHaveBeenCalled();
-    expect(manager.enablePlugin).toHaveBeenCalledWith("quickadd");
+    expect(manager.enablePlugin).not.toHaveBeenCalled();
     expect(adapter.writeBinary).not.toHaveBeenCalled();
     expect(report.failed).toEqual([]);
   });

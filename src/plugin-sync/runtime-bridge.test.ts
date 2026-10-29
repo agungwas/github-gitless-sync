@@ -25,6 +25,12 @@ describe("PluginRuntimeBridge", () => {
     expect(manager.enablePlugin).not.toHaveBeenCalled();
   });
 
+  it("reports Obsidian's false enable result as a failure", async () => {
+    const manager = { plugins: {}, enablePlugin: vi.fn(async () => false) };
+    const bridge = new PluginRuntimeBridge(manager, "gitless");
+    await expect(bridge.enable("quickadd")).rejects.toThrow("Obsidian failed to enable plugin quickadd");
+  });
+
   it("observes completed native install and uninstall while preserving results", async () => {
     const events: string[] = [];
     const manager = {

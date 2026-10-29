@@ -81,10 +81,12 @@ async function createAndroidFixture(localModifiedAt: number, nativeSyncEnabled =
     throw new Error("Unexpected plugin conflict");
   });
   const unload = vi.fn(async (id: string) => { delete pluginManager.plugins[id]; });
+  const enable = vi.fn(async () => undefined);
   const pluginManager = {
     plugins: { [PLUGIN_ID]: {} } as Record<string, unknown>,
+    enabledPlugins: new Set<string>(),
     disablePlugin: unload,
-    enablePlugin: vi.fn(async () => undefined),
+    enablePlugin: enable,
   };
   const adapter = {
     exists: vi.fn(async (path: string) => localFiles.has(path) || localDirectories.has(path)),
@@ -184,10 +186,20 @@ async function createAndroidFixture(localModifiedAt: number, nativeSyncEnabled =
     }),
   } as unknown as GithubClient;
   return {
-    manager, internals, localFiles, localDirectories, remoteFiles, trackedFiles, conflicts, unload, adapter,
+    manager, internals, localFiles, localDirectories, remoteFiles, trackedFiles, conflicts, unload, enable, adapter, pluginManager,
     sync: () => internals.syncImpl(),
     remoteMetadata: () => JSON.parse(remoteFiles.get(METADATA_PATH)!) as Metadata,
   };
+}
+
+function prepareLiveRemotePlugin(fixture: Awaited<ReturnType<typeof createAndroidFixture>>): Metadata {
+  const remote = fixture.remoteMetadata();
+  for (const path of [MANIFEST_PATH, SETTINGS_PATH]) {
+    delete remote.files[path].deleted;
+    delete remote.files[path].deletedAt;
+    fixture.remoteFiles.set(path, fixture.localFiles.get(path)!);
+  }
+  return remote;
 }
 
 describe("Community plugin sync across devices", () => {
@@ -195,6 +207,57 @@ describe("Community plugin sync across devices", () => {
   afterEach(() => {
     for (const manager of managers.splice(0)) manager.stopPluginSync();
     vi.restoreAllMocks();
+  });
+
+  it("does not unload a running delayed plugin when syncing an unrelated change", async () => {
+    const fixture = await createAndroidFixture(5_000);
+    managers.push(fixture.manager);
+    const remote = prepareLiveRemotePlugin(fixture);
+    fixture.remoteFiles.set(METADATA_PATH, JSON.stringify(remote));
+    fixture.localFiles.set(SETTINGS_PATH, '{"theme":"changed"}');
+    fixture.trackedFiles[SETTINGS_PATH].dirty = true;
+
+    await fixture.sync();
+
+    expect(fixture.unload).not.toHaveBeenCalled();
+    expect(fixture.localFiles.has(`${PLUGIN_FOLDER}/main.js`)).toBe(true);
+  });
+
+  it("downloads a changed enabled list without changing runtime state", async () => {
+    const fixture = await createAndroidFixture(5_000);
+    managers.push(fixture.manager);
+    const remote = prepareLiveRemotePlugin(fixture);
+    const enabled = JSON.stringify([PLUGIN_ID]);
+    remote.files[ENABLED_PATH].sha = await blobSha(enabled);
+    remote.files[ENABLED_PATH].lastModified = 6_000;
+    fixture.remoteFiles.set(ENABLED_PATH, enabled);
+    fixture.remoteFiles.set(METADATA_PATH, JSON.stringify(remote));
+
+    await fixture.sync();
+
+    expect(fixture.localFiles.get(ENABLED_PATH)).toBe(enabled);
+    expect(fixture.pluginManager.enabledPlugins.has(PLUGIN_ID)).toBe(true);
+    expect(fixture.unload).not.toHaveBeenCalled();
+    expect(fixture.enable).not.toHaveBeenCalled();
+  });
+
+  it("defers a downloaded disable while preserving the running plugin", async () => {
+    const fixture = await createAndroidFixture(5_000);
+    managers.push(fixture.manager);
+    const remote = prepareLiveRemotePlugin(fixture);
+    const localEnabled = JSON.stringify([PLUGIN_ID]);
+    fixture.localFiles.set(ENABLED_PATH, localEnabled);
+    fixture.trackedFiles[ENABLED_PATH].sha = await blobSha(localEnabled);
+    fixture.pluginManager.enabledPlugins.add(PLUGIN_ID);
+    remote.files[ENABLED_PATH].lastModified = 6_000;
+    fixture.remoteFiles.set(METADATA_PATH, JSON.stringify(remote));
+
+    await fixture.sync();
+
+    expect(fixture.localFiles.get(ENABLED_PATH)).toBe("[]");
+    expect(fixture.pluginManager.enabledPlugins.has(PLUGIN_ID)).toBe(false);
+    expect(fixture.unload).not.toHaveBeenCalled();
+    expect(fixture.pluginManager.plugins[PLUGIN_ID]).toBeDefined();
   });
 
   it("does not republish an unchanged manifest when Android's timestamp is newer", async () => {

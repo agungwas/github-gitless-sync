@@ -44,7 +44,8 @@ Desired-state paths are never orphaned regardless of the feature toggle, except 
 After each sync with a complete pinned snapshot. For each local plugin folder (compatible, not custom, not self): hydrate `main.js`/`styles.css` only when the id is in `hydrateIds`, `main.js` is missing, or the id is in `pendingHydrate`. No hashing, receipts or proofs.
 - `hydrateIds` = managed `manifest.json` download actions of this sync plus every manifest settled by a conflict resolution (except accept-uninstall).
 - Failure: old binary restored, id added to `pendingHydrate` (lives for the Obsidian session); success removes it. A registry miss is reported as skipped, other errors as failed.
-- Then enable/disable to match `community-plugins.json`.
+- Sync enabled state from `community-plugins.json` into Obsidian's in-memory saved startup list. State changes take effect after an Obsidian restart; a notice appears when they change. Existing runtime state is left alone, except when updating or uninstalling a package.
+- A running plugin is unloaded during its package update and restored afterward. An inactive plugin stays inactive after installation or update, even if its saved startup state is enabled.
 
 ### Uninstall
 - Local: native wrapper, or the removal scan (id absent for 2 consecutive scans), writes the ordinary tombstone `deleted: true`, `deletedAt` on `manifest.json` and `data.json`. Vault events do not fire for config-dir files, hence the wrapper and scan.
@@ -52,7 +53,7 @@ After each sync with a complete pinned snapshot. For each local plugin folder (c
 - Conflict: remote manifest tombstoned and local manifest/`data.json` sha differs from metadata. `conflictHandling` `ask` → prompt; `overwriteLocal` → accept uninstall; `overwriteRemote` → keep local.
 
 ### Enabled list
-`community-plugins.json` is a plain synced file (conflicts are ordinary file conflicts). On mobile, ids present in the remote list whose local manifest has `isDesktopOnly: true` are re-added to the local file before upload.
+`community-plugins.json` is a plain synced file (conflicts are ordinary file conflicts). Its enabled state is applied at the next app restart; the matching in-memory startup list is updated during sync so a later Obsidian save does not overwrite the file with stale state. On mobile, ids present in the remote list whose local manifest has `isDesktopOnly: true` are re-added to the local file before upload. The in-memory list uses an internal Obsidian API; behavior on physical mobile devices remains unverified.
 
 ### Sync triggers
 Only manual, interval, startup, focus and blur syncs. Native install/uninstall/enable/disable never start one.

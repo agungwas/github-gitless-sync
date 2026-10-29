@@ -25,7 +25,7 @@ function setup(enabled = true) {
   metadata.data = { lastSync: 1, files: {} };
   vi.spyOn(metadata, "save").mockResolvedValue(undefined);
   const logger = new Logger(vault, enabled);
-  const manager = { plugins: { quickadd: {} }, enablePlugin: vi.fn(), disablePlugin: vi.fn() };
+  const manager = { plugins: { quickadd: {} }, enabledPlugins: new Set<string>(), enablePlugin: vi.fn(), disablePlugin: vi.fn() };
   const source = new OfficialPackageSource();
   const resolve = vi.spyOn(source, "resolve").mockRejectedValue(new Error("Exact plugin release unavailable (HTTP 403)"));
   const reconciler = new PluginLifecycleReconciler(
@@ -35,7 +35,7 @@ function setup(enabled = true) {
     const entry: unknown = JSON.parse(line);
     return entry;
   });
-  return { reconciler, adapter, manifest, manager, resolve, entries };
+  return { reconciler, adapter, manifest, manager, metadata, resolve, entries };
 }
 
 describe("Community plugin file logging", () => {
@@ -145,16 +145,15 @@ describe("Community plugin file logging", () => {
     })]));
   });
 
-  it("records successful activation with the plugin ID in its own entry", async () => {
+  it("records no immediate activation when enabled state changes", async () => {
     const { reconciler, manager, entries } = setup();
     Reflect.deleteProperty(manager.plugins, "quickadd");
 
     await reconciler.reconcile(true, new Set());
 
-    expect(entries()).toEqual(expect.arrayContaining([expect.objectContaining({
-      level: "INFO", message: "Community plugin enabled",
-      additional_data: { phase: "reconciliation", id: "quickadd" },
-    })]));
+    expect(manager.enablePlugin).not.toHaveBeenCalled();
+    expect(manager.enabledPlugins.has("quickadd")).toBe(true);
+    expect(entries()).not.toEqual(expect.arrayContaining([expect.objectContaining({ message: "Community plugin enabled" })]));
   });
 
   it("records skipped incomplete snapshots before returning", async () => {
@@ -169,19 +168,20 @@ describe("Community plugin file logging", () => {
   });
 
   it("records lifecycle failure and restart recommendation", async () => {
-    const { reconciler, manager, entries } = setup();
-    Reflect.deleteProperty(manager.plugins, "quickadd");
-    manager.enablePlugin.mockRejectedValue(new Error("Plugin onload failed"));
+    const { reconciler, manager, metadata, entries } = setup();
+    const path = ".obsidian/plugins/quickadd/manifest.json";
+    metadata.data.files[path] = { path, sha: null, dirty: false, justDownloaded: false, lastModified: 1, deleted: true };
+    manager.disablePlugin.mockRejectedValue(new Error("Plugin unload failed"));
 
     await reconciler.reconcile(true, new Set());
 
     expect(entries()).toEqual(expect.arrayContaining([
       expect.objectContaining({ level: "ERROR", message: "Community plugin operation failed",
-        additional_data: expect.objectContaining({ phase: "reconciliation", id: "quickadd", reason: expect.stringContaining("Error: Plugin onload failed") }),
+        additional_data: expect.objectContaining({ phase: "reconciliation", id: "quickadd", reason: expect.stringContaining("Error: Plugin unload failed") }),
       }),
       expect.objectContaining({
         level: "ERROR", message: "Community plugin reload failed; restart recommended",
-        additional_data: { phase: "reconciliation", id: "quickadd", reason: "enable failed" },
+        additional_data: { phase: "reconciliation", id: "quickadd", reason: "disable failed" },
       }),
     ]));
   });

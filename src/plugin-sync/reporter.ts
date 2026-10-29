@@ -40,6 +40,10 @@ export class PluginSyncReporter {
     this.lastSkipNotice = skipNotice;
   }
 
+  notifyRestartRequired(): void {
+    new Notice("Restart Obsidian to apply synced community plugin state.");
+  }
+
   private reasonDetails(entry: string): { readonly id?: string; readonly reason: string } {
     const separator = entry.indexOf(": ");
     const id = entry.slice(0, separator);

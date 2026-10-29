@@ -1,6 +1,8 @@
 export interface PluginManagerRuntime {
   plugins: Record<string, unknown>;
-  enablePlugin?: (id: string) => Promise<void>;
+  enabledPlugins?: Set<string>;
+  loadManifests?: () => Promise<void>;
+  enablePlugin?: (id: string) => Promise<void | boolean>;
   disablePlugin?: (id: string) => Promise<void>;
   installPlugin?: (id: string, ...args: unknown[]) => Promise<unknown>;
   uninstallPlugin?: (id: string, ...args: unknown[]) => Promise<unknown>;
@@ -24,6 +26,21 @@ export class PluginRuntimeBridge {
 
   isLoaded(id: string): boolean {
     return Object.prototype.hasOwnProperty.call(this.manager.plugins, id);
+  }
+
+  savedEnabledIds(): Set<string> | null {
+    return this.manager.enabledPlugins instanceof Set ? new Set(this.manager.enabledPlugins) : null;
+  }
+
+  setSavedEnabled(id: string, enabled: boolean): void {
+    const ids = this.manager.enabledPlugins;
+    if (!(ids instanceof Set)) throw new Error("Obsidian enabled plugin state unavailable");
+    if (enabled) ids.add(id);
+    else ids.delete(id);
+  }
+
+  async refreshManifests(): Promise<void> {
+    await this.manager.loadManifests?.();
   }
 
   isMutating(id: string): boolean {
@@ -79,7 +96,8 @@ export class PluginRuntimeBridge {
     await this.enqueue(async () => {
       if (this.isLoaded(id)) return;
       if (!this.manager.enablePlugin) throw new Error("Obsidian enablePlugin API unavailable");
-      await this.invokeLifecycle(this.manager.enablePlugin, id);
+      const result = await this.invokeLifecycle(this.manager.enablePlugin, id);
+      if (result === false) throw new Error(`Obsidian failed to enable plugin ${id}`);
     });
   }
 
@@ -116,11 +134,11 @@ export class PluginRuntimeBridge {
     return next;
   }
 
-  private async invokeLifecycle(method: ((id: string) => Promise<void>) | undefined, id: string): Promise<void> {
+  private async invokeLifecycle(method: ((id: string) => Promise<void | boolean>) | undefined, id: string): Promise<void | boolean> {
     if (!method) throw new Error("Obsidian plugin lifecycle API unavailable");
     this.internalLifecycleCalls.add(id);
     try {
-      await method.call(this.manager, id);
+      return await method.call(this.manager, id);
     } finally {
       this.internalLifecycleCalls.delete(id);
     }
