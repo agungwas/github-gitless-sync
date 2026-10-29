@@ -12,8 +12,8 @@ describe.each([
   afterEach(cleanup);
 
   it.each([
-    { choice: "keep-local", label: "Keep local plugin and settings" },
-    { choice: "accept-uninstall", label: "Accept uninstall and remove local changes" },
+    { choice: "keep-local", label: "Keep installed" },
+    { choice: "accept-uninstall", label: "Uninstall" },
   ])("preserves $choice until confirmation", ({ choice, label }) => {
     const path = ".obsidian/plugins/quickadd/manifest.json";
     const files: ConflictFile[] = [{

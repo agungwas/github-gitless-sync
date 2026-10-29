@@ -14,8 +14,21 @@
     user-select: text;
 }
 
+.gitless-logs-actions {
+    display: flex;
+    gap: var(--size-4-2);
+    margin-top: var(--size-4-4);
+}
+
+.gitless-logs-actions button.gitless-logs-clean {
+    margin-right: auto;
+    background-color: var(--color-blue);
+    color: var(--text-on-accent);
+}
+
 .gitless-logs-table {
-    width: 100%;
+    width: max-content;
+    max-width: 100%;
     border-collapse: collapse;
     font-size: var(--font-ui-small);
 }
@@ -34,21 +47,76 @@
     background: var(--background-primary);
 }
 
-.gitless-logs-table td:first-child,
-.gitless-logs-table td:nth-child(2) {
+.gitless-logs-table th:first-child,
+.gitless-logs-table td:first-child {
+    width: 1%;
     white-space: nowrap;
 }
 
-.gitless-logs-table td:nth-child(3) {
+.gitless-logs-table th:last-child,
+.gitless-logs-table td:last-child {
+    width: 1%;
+    text-align: right;
+    white-space: nowrap;
+}
+
+.gitless-logs-table td:nth-child(2) {
     min-width: 12rem;
     white-space: pre-wrap;
     overflow-wrap: anywhere;
 }
 
-.gitless-logs-table pre {
-    min-width: 12rem;
-    max-width: 28rem;
+.gitless-log-expandable-row {
+    cursor: pointer;
+}
+
+.gitless-logs-table button.gitless-log-details-toggle,
+.gitless-logs-table button.gitless-log-details-toggle:hover,
+.gitless-logs-table button.gitless-log-details-toggle:focus,
+.gitless-logs-table button.gitless-log-details-toggle:active {
+    display: flex;
+    width: 100%;
+    height: auto;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: var(--size-4-2);
+    appearance: none;
+    border: 0;
+    border-radius: 0;
+    padding: 0;
+    background: transparent;
+    box-shadow: none;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+.gitless-log-details-toggle span:first-child {
+    min-width: 0;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
+.gitless-log-details-indicator {
+    flex: none;
+}
+
+.gitless-log-details-toggle:focus-visible {
+    outline: 2px solid var(--interactive-accent);
+    outline-offset: 2px;
+}
+
+.gitless-log-additional-data {
+    max-width: 100%;
+    margin: var(--size-4-2) 0 0;
     white-space: pre-wrap;
     overflow-wrap: anywhere;
     font-family: var(--font-monospace);
+}
+
+@media (max-width: 40rem) {
+    .gitless-logs-table td:nth-child(2) {
+        min-width: 10rem;
+    }
 }

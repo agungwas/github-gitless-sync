@@ -15,8 +15,10 @@ function setup(enabled = true) {
     list: vi.fn(async () => ({ files: [], folders: [".obsidian/plugins/quickadd"] })),
     read: vi.fn(async (path: string) => path.endsWith("community-plugins.json") ? '["quickadd"]' : JSON.stringify(manifest)),
     exists: vi.fn(async (path: string) => !path.endsWith("styles.css")),
+    mkdir: vi.fn(async () => undefined),
     readBinary: vi.fn(async () => new TextEncoder().encode("official code").buffer),
     append: vi.fn(async (_path: string, text: string) => { contents += text; }),
+    rmdir: vi.fn(async () => undefined),
   };
   const vault = { configDir: ".obsidian", adapter } as never;
   const metadata = new MetadataStore(vault);
@@ -37,6 +39,70 @@ function setup(enabled = true) {
 }
 
 describe("Community plugin file logging", () => {
+  it("logs package staging path failures with the original filesystem cause", async () => {
+    const { reconciler, adapter, manifest, resolve, entries } = setup();
+    const cause = Object.assign(new Error("Permission denied"), { code: "EACCES" });
+    adapter.exists.mockImplementation(async (path: string) => path === ".obsidian/plugins/quickadd/manifest.json");
+    adapter.mkdir.mockRejectedValueOnce(cause);
+    resolve.mockResolvedValue({
+      manifest,
+      assets: { mainJs: new TextEncoder().encode("main").buffer, stylesCss: null },
+    } as never);
+
+    await reconciler.reconcile(true, new Set(["quickadd"]));
+
+    const failure = entries().find((entry) => typeof entry === "object" && entry !== null &&
+      "message" in entry && entry.message === "Community plugin operation failed");
+    expect(failure).toMatchObject({
+      level: "ERROR",
+      additional_data: {
+        id: "quickadd",
+        reason: expect.stringContaining(".obsidian/.gitless-plugin-staging"),
+      },
+    });
+    expect(JSON.stringify(failure)).toContain("EACCES");
+  });
+
+  it("records removal-scan directory-list failures with their path and cause", async () => {
+    const { reconciler, adapter, entries } = setup();
+    const cause = Object.assign(new Error("Permission denied"), { code: "EACCES" });
+    adapter.list.mockRejectedValueOnce(new Error("Could not list plugin directory", { cause }));
+
+    await reconciler.observeLocalRemovals();
+
+    expect(entries()).toContainEqual(expect.objectContaining({
+      level: "ERROR",
+      message: "Community plugin removal scan could not list plugin directory",
+      additional_data: expect.objectContaining({
+        path: ".obsidian/plugins",
+        error: expect.objectContaining({
+          message: "Could not list plugin directory",
+          cause: expect.objectContaining({ message: "Permission denied", code: "EACCES" }),
+        }),
+      }),
+    }));
+  });
+
+  it("records removal-scan enabled-list read failures with their path and cause", async () => {
+    const { reconciler, adapter, entries } = setup();
+    const cause = Object.assign(new Error("No such file"), { code: "ENOENT" });
+    adapter.read.mockRejectedValueOnce(new Error("Could not read enabled plugin list", { cause }));
+
+    await reconciler.observeLocalRemovals();
+
+    expect(entries()).toContainEqual(expect.objectContaining({
+      level: "ERROR",
+      message: "Community plugin removal scan could not read enabled plugin list",
+      additional_data: expect.objectContaining({
+        path: ".obsidian/community-plugins.json",
+        error: expect.objectContaining({
+          message: "Could not read enabled plugin list",
+          cause: expect.objectContaining({ message: "No such file", code: "ENOENT" }),
+        }),
+      }),
+    }));
+  });
+
   it("records a failed hydrate with the plugin id and underlying reason", async () => {
     const { reconciler, adapter, entries } = setup();
 
@@ -111,7 +177,7 @@ describe("Community plugin file logging", () => {
 
     expect(entries()).toEqual(expect.arrayContaining([
       expect.objectContaining({ level: "ERROR", message: "Community plugin operation failed",
-        additional_data: { phase: "reconciliation", id: "quickadd", reason: "Error: Plugin onload failed" },
+        additional_data: expect.objectContaining({ phase: "reconciliation", id: "quickadd", reason: expect.stringContaining("Error: Plugin onload failed") }),
       }),
       expect.objectContaining({
         level: "ERROR", message: "Community plugin reload failed; restart recommended",
@@ -120,10 +186,10 @@ describe("Community plugin file logging", () => {
     ]));
   });
 
-  it("does not write plugin diagnostics when logging is disabled", async () => {
+  it("writes no plugin diagnostics when logging is disabled", async () => {
     const { reconciler, adapter, entries } = setup(false);
 
-    await reconciler.reconcile(true, new Set());
+    await reconciler.reconcile(true, new Set(["quickadd"]));
 
     expect(adapter.append).not.toHaveBeenCalled();
     expect(entries()).toEqual([]);

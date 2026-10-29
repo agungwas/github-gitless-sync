@@ -1,6 +1,6 @@
 import { Vault } from "obsidian";
 import MetadataStore from "../metadata-store";
-import Logger from "../logger";
+import Logger, { serializeError } from "../logger";
 import { GitHubSyncSettings } from "../settings/settings";
 import { PluginLifecycleReconciler } from "./reconciler";
 import { PluginManagerRuntime, PluginRuntimeBridge } from "./runtime-bridge";
@@ -46,7 +46,9 @@ export class PluginSyncCoordinator {
     this.stopObservingMutations = reconciler.startObservingNativeMutations();
     this.removalScanTimer = window.setInterval(() => {
       if (document.visibilityState !== "visible") return;
-      void reconciler.observeLocalRemovals().catch((error) => this.options.logger.error("Community plugin scan failed", String(error)));
+      void reconciler.observeLocalRemovals().catch((error) => this.options.logger.error("Community plugin scan failed", {
+        error: serializeError(error),
+      }));
     }, LOCAL_REMOVAL_SCAN_INTERVAL_MS);
   }
 

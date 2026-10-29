@@ -4,6 +4,7 @@ import { PluginRuntimeBridge } from "./runtime-bridge";
 import { FileMetadata } from "../metadata-store";
 
 const MANIFEST_PATH = ".obsidian/plugins/quickadd/manifest.json";
+const PLUGIN_FOLDER = ".obsidian/plugins/quickadd";
 const MAIN_PATH = ".obsidian/plugins/quickadd/main.js";
 const STYLES_PATH = ".obsidian/plugins/quickadd/styles.css";
 const MANIFEST = { id: "quickadd", name: "QuickAdd", version: "1.2.3", minAppVersion: "1.0.0", isDesktopOnly: false };
@@ -22,17 +23,24 @@ function harness(options: HarnessOptions = {}) {
   const files = new Map<string, ArrayBuffer>(
     Object.entries({ [MANIFEST_PATH]: JSON.stringify(MANIFEST), ...options.files }).map(([path, text]) => [path, bytes(text)]),
   );
+  const folders = new Set([PLUGIN_FOLDER]);
   const adapter = {
-    list: vi.fn(async () => ({ files: [], folders: [".obsidian/plugins/quickadd"] })),
+    list: vi.fn(async () => ({ files: [], folders: [...folders] })),
     read: vi.fn(async (path: string) => path.endsWith("community-plugins.json")
       ? (options.enabled === false ? "[]" : '["quickadd"]')
       : new TextDecoder().decode(files.get(path))),
     readBinary: vi.fn(async (path: string) => files.get(path)!),
-    exists: vi.fn(async (path: string) => files.has(path) || path === ".obsidian/plugins/quickadd"),
+    exists: vi.fn(async (path: string) => files.has(path) || folders.has(path)),
     writeBinary: vi.fn(async (path: string, data: ArrayBuffer) => { files.set(path, data); }),
-    mkdir: vi.fn(async () => undefined),
+    mkdir: vi.fn(async (path: string) => { folders.add(path); }),
     remove: vi.fn(async (path: string) => { files.delete(path); }),
-    rmdir: vi.fn(async () => undefined),
+    rmdir: vi.fn(async (path: string, recursive?: boolean) => {
+      folders.delete(path);
+      if (recursive) {
+        for (const filePath of files.keys()) if (filePath.startsWith(`${path}/`)) files.delete(filePath);
+        for (const folderPath of folders) if (folderPath.startsWith(`${path}/`)) folders.delete(folderPath);
+      }
+    }),
   };
   const metadataStore = {
     data: { lastSync: 1, files: options.metadataFiles ?? {} },
@@ -195,7 +203,7 @@ describe("PluginLifecycleReconciler", () => {
   });
 
   it("unloads and removes the folder of a plugin the remote tombstoned (T8)", async () => {
-    const { reconciler, manager, adapter } = harness({
+    const { reconciler, manager, adapter, files } = harness({
       loaded: true,
       files: { [MAIN_PATH]: "main" },
       metadataFiles: {
@@ -209,6 +217,8 @@ describe("PluginLifecycleReconciler", () => {
 
     expect(manager.disablePlugin).toHaveBeenCalledWith("quickadd");
     expect(adapter.rmdir).toHaveBeenCalledWith(".obsidian/plugins/quickadd", true);
+    await expect(adapter.exists(".obsidian/plugins/quickadd")).resolves.toBe(false);
+    expect(files.has(MAIN_PATH)).toBe(false);
     expect(report.uninstalled).toEqual(["quickadd"]);
   });
 

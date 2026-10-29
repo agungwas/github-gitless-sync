@@ -49,6 +49,15 @@ async function createAndroidFixture(localModifiedAt: number, nativeSyncEnabled =
     [`${PLUGIN_FOLDER}/main.js`, "local plugin executable"],
     [ENABLED_PATH, "[]"],
   ]);
+  const localDirectories = new Set<string>();
+  for (const path of localFiles.keys()) {
+    const segments = path.split("/").slice(0, -1);
+    let directory = "";
+    for (const segment of segments) {
+      directory = directory ? `${directory}/${segment}` : segment;
+      localDirectories.add(directory);
+    }
+  }
   const trackedFiles: Record<string, FileMetadata> = {};
   for (const path of [MANIFEST_PATH, SETTINGS_PATH, ENABLED_PATH]) {
     trackedFiles[path] = {
@@ -78,7 +87,7 @@ async function createAndroidFixture(localModifiedAt: number, nativeSyncEnabled =
     enablePlugin: vi.fn(async () => undefined),
   };
   const adapter = {
-    exists: vi.fn(async (path: string) => localFiles.has(path) || [...localFiles.keys()].some((key) => key.startsWith(`${path}/`))),
+    exists: vi.fn(async (path: string) => localFiles.has(path) || localDirectories.has(path)),
     list: vi.fn(async (folder: string) => {
       const files: string[] = [];
       const folders = new Set<string>();
@@ -88,6 +97,10 @@ async function createAndroidFixture(localModifiedAt: number, nativeSyncEnabled =
         if (relative.includes("/")) folders.add(`${folder}/${relative.split("/")[0]}`);
         else files.push(path);
       }
+      for (const path of localDirectories) {
+        if (!path.startsWith(`${folder}/`)) continue;
+        folders.add(`${folder}/${path.slice(folder.length + 1).split("/")[0]}`);
+      }
       return { files, folders: [...folders] };
     }),
     read: vi.fn(async (path: string) => {
@@ -96,14 +109,28 @@ async function createAndroidFixture(localModifiedAt: number, nativeSyncEnabled =
       return text;
     }),
     readBinary: vi.fn(async (path: string) => new TextEncoder().encode(localFiles.get(path)!).buffer),
-    write: vi.fn(async (path: string, text: string) => { localFiles.set(path, text); }),
-    writeBinary: vi.fn(async (path: string, bytes: ArrayBuffer) => { localFiles.set(path, new TextDecoder().decode(bytes)); }),
+    write: vi.fn(async (path: string, text: string) => {
+      const parent = path.split("/").slice(0, -1).join("/");
+      if (parent && !localDirectories.has(parent)) throw Object.assign(new Error(`Missing parent: ${parent}`), { code: "ENOENT" });
+      localFiles.set(path, text);
+    }),
+    writeBinary: vi.fn(async (path: string, bytes: ArrayBuffer) => {
+      const parent = path.split("/").slice(0, -1).join("/");
+      if (parent && !localDirectories.has(parent)) throw Object.assign(new Error(`Missing parent: ${parent}`), { code: "ENOENT" });
+      localFiles.set(path, new TextDecoder().decode(bytes));
+    }),
     remove: vi.fn(async (path: string) => { localFiles.delete(path); }),
     rmdir: vi.fn(async (folder: string) => {
       for (const path of localFiles.keys()) if (path.startsWith(`${folder}/`)) localFiles.delete(path);
+      for (const path of localDirectories) if (path === folder || path.startsWith(`${folder}/`)) localDirectories.delete(path);
     }),
-    mkdir: vi.fn(async () => undefined),
-    stat: vi.fn(async () => ({ mtime: localModifiedAt, ctime: localModifiedAt, size: 1, type: "file" })),
+    mkdir: vi.fn(async (path: string) => { localDirectories.add(path); }),
+    stat: vi.fn(async (path: string) => ({
+      mtime: localModifiedAt,
+      ctime: localModifiedAt,
+      size: 1,
+      type: localFiles.has(path) ? "file" : localDirectories.has(path) ? "folder" : null,
+    })),
   };
   const manager = new SyncManager(
     { configDir: ".obsidian", adapter } as unknown as Vault,
@@ -157,13 +184,13 @@ async function createAndroidFixture(localModifiedAt: number, nativeSyncEnabled =
     }),
   } as unknown as GithubClient;
   return {
-    manager, internals, localFiles, remoteFiles, trackedFiles, conflicts, unload, adapter,
+    manager, internals, localFiles, localDirectories, remoteFiles, trackedFiles, conflicts, unload, adapter,
     sync: () => internals.syncImpl(),
     remoteMetadata: () => JSON.parse(remoteFiles.get(METADATA_PATH)!) as Metadata,
   };
 }
 
-describe("macOS uninstall received by Android", () => {
+describe("Community plugin sync across devices", () => {
   const managers: SyncManager[] = [];
   afterEach(() => {
     for (const manager of managers.splice(0)) manager.stopPluginSync();
@@ -196,6 +223,51 @@ describe("macOS uninstall received by Android", () => {
       expect(fixture.remoteMetadata().files[path]).toMatchObject({ deleted: true, deletedAt: 1_000 });
     }
     expect(fixture.remoteFiles.has(MANIFEST_PATH)).toBe(false);
+  });
+
+  it("downloads live plugin files when matching metadata remains but local folder is missing", async () => {
+    const fixture = await createAndroidFixture(5_000);
+    managers.push(fixture.manager);
+
+    const remote = fixture.remoteMetadata();
+    for (const path of [MANIFEST_PATH, SETTINGS_PATH]) {
+      const remoteFile = remote.files[path];
+      delete remoteFile.deleted;
+      delete remoteFile.deletedAt;
+      remoteFile.lastModified = 5_000;
+      fixture.remoteFiles.set(path, path === MANIFEST_PATH ? MANIFEST_TEXT : SETTINGS_TEXT);
+
+      const localFile = fixture.trackedFiles[path];
+      localFile.deleted = true;
+      localFile.deletedAt = 1_000;
+    }
+    const enabledPlugins = JSON.stringify([PLUGIN_ID]);
+    fixture.remoteFiles.set(ENABLED_PATH, enabledPlugins);
+    fixture.localFiles.set(ENABLED_PATH, enabledPlugins);
+    fixture.remoteFiles.set(METADATA_PATH, JSON.stringify(remote));
+    for (const path of [...fixture.localFiles.keys()]) {
+      if (path.startsWith(`${PLUGIN_FOLDER}/`)) fixture.localFiles.delete(path);
+    }
+    for (const path of [...fixture.localDirectories]) {
+      if (path === PLUGIN_FOLDER || path.startsWith(`${PLUGIN_FOLDER}/`)) fixture.localDirectories.delete(path);
+    }
+
+    await fixture.sync();
+
+    expect(fixture.adapter.writeBinary).toHaveBeenCalledWith(MANIFEST_PATH, expect.anything());
+    expect(fixture.localFiles.has(MANIFEST_PATH)).toBe(true);
+    expect(fixture.localDirectories.has(PLUGIN_FOLDER)).toBe(true);
+    for (const [path, text] of [[MANIFEST_PATH, MANIFEST_TEXT], [SETTINGS_PATH, SETTINGS_TEXT]] as const) {
+      expect(fixture.remoteMetadata().files[path]).toMatchObject({
+        sha: await blobSha(text), lastModified: 5_000,
+      });
+      expect(fixture.remoteMetadata().files[path]).not.toHaveProperty("deleted", true);
+    }
+
+    await fixture.sync();
+    expect(fixture.conflicts).not.toHaveBeenCalled();
+    expect(fixture.remoteMetadata().files[MANIFEST_PATH]).not.toHaveProperty("deleted", true);
+    expect(fixture.localFiles.has(MANIFEST_PATH)).toBe(true);
   });
 
   it("asks before deleting a locally edited settings file", async () => {

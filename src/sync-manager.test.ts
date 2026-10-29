@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import SyncManager from './sync-manager';
 import { Vault, Notice } from 'obsidian';
 import { GitHubSyncSettings } from './settings/settings';
-import Logger from './logger';
+import Logger, { serializeError } from './logger';
 import { GetTreeResponseItem } from './github/client';
 import { FileMetadata } from './metadata-store';
 
@@ -41,6 +41,7 @@ describe('SyncManager - Sync in Progress Notice', () => {
     mockVault = {
       adapter: {
         list: vi.fn(),
+        read: vi.fn(),
       },
       getRoot: vi.fn().mockReturnValue({ path: '/' }),
       configDir: '.obsidian'
@@ -84,6 +85,67 @@ describe('SyncManager - Sync in Progress Notice', () => {
 
     // The method should exit early and Notice should be called
     expect(Notice).toHaveBeenCalledWith("Sync already in progress");
+  });
+
+  it("logs nested filesystem causes and still shows failure Notice if log write fails", async () => {
+    const rootCause = Object.assign(new Error("Permission denied"), { code: "EACCES", path: ".obsidian/plugins/x/data.json" });
+    const pathError = new Error("Failed to write plugin settings", { cause: rootCause });
+    vi.spyOn(syncManager as any, "syncImpl").mockRejectedValue(pathError);
+    mockLogger.error = vi.fn().mockRejectedValue(new Error("Log disk is full"));
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    await syncManager.sync();
+
+    expect(mockLogger.error).toHaveBeenCalledWith("Error syncing", { error: serializeError(pathError) });
+    expect(Notice).toHaveBeenCalledWith(`Error syncing. ${pathError}`);
+    expect(consoleError).toHaveBeenCalledWith(
+      expect.stringContaining("Failed to persist sync error"),
+      expect.objectContaining({ error: serializeError(new Error("Log disk is full")) }),
+    );
+    consoleError.mockRestore();
+  });
+
+  it("logs first-sync filesystem failures before propagating them", async () => {
+    const rootCause = Object.assign(new Error("No such file"), { code: "ENOENT", path: ".obsidian/plugins/x/manifest.json" });
+    const pathError = new Error("Failed to read plugin manifest", { cause: rootCause });
+    vi.spyOn(syncManager as any, "firstSyncImpl").mockRejectedValue(pathError);
+
+    await expect(syncManager.firstSync()).rejects.toBe(pathError);
+
+    expect(mockLogger.error).toHaveBeenCalledWith("Error during first sync", { error: serializeError(pathError) });
+  });
+
+  it("logs unreadable plugin manifest paths while preserving desktop-only ids", async () => {
+    const pathError = Object.assign(new Error("Permission denied"), { code: "EACCES", path: ".obsidian/plugins/x/manifest.json" });
+    (mockVault.adapter.read as ReturnType<typeof vi.fn>).mockRejectedValue(pathError);
+
+    await (syncManager as any).preserveDesktopOnlyIds("[]", '["x"]');
+
+    expect(mockLogger.error).toHaveBeenCalledWith("Could not inspect community plugin manifest", {
+      path: ".obsidian/plugins/x/manifest.json",
+      error: serializeError(pathError),
+    });
+  });
+
+  it("propagates metadata persistence failure during commit", async () => {
+    const persistenceError = Object.assign(new Error("Metadata write failed"), { code: "EACCES", path: ".obsidian/github-sync-metadata.json" });
+    const manager = syncManager as any;
+    manager.metadataStore = {
+      data: { lastSync: 0, files: {} },
+      save: vi.fn().mockRejectedValueOnce(persistenceError).mockResolvedValue(undefined),
+    };
+    manager.stampResolvedConflictTimes = vi.fn();
+    manager.attachShasToTreeFiles = vi.fn();
+    manager.findExpiredTombstones = vi.fn().mockResolvedValue(new Map());
+    manager.dropTombstonesFromSnapshot = vi.fn();
+    manager.writeMetadataIntoTree = vi.fn();
+    manager.prepareConflictDestinations = vi.fn();
+    manager.pushCommit = vi.fn();
+    manager.mergeCommittedSnapshotIntoLive = vi.fn();
+    manager.dropTombstonesFromLiveMetadata = vi.fn();
+    manager.applyResolvedConflictContent = vi.fn();
+
+    await expect(syncManager.commitSync({}, "tree", {})).rejects.toBe(persistenceError);
   });
 });
 
@@ -391,6 +453,7 @@ describe('SyncManager - Filename Context in Filesystem Error Messages', () => {
       adapter: {
         list: vi.fn(),
         exists: vi.fn(),
+        stat: vi.fn().mockResolvedValue({ type: 'folder', ctime: 0, mtime: 0, size: 0 }),
         mkdir: vi.fn(),
         writeBinary: vi.fn(),
         remove: vi.fn(),
@@ -455,6 +518,79 @@ describe('SyncManager - Filename Context in Filesystem Error Messages', () => {
       );
     });
 
+    it('downloads a manifest with a matching metadata SHA when the local file is missing', async () => {
+      const manifestPath = '.obsidian/plugins/lazy-plugins/manifest.json';
+      const remoteManifest = { ...mockFile, path: manifestPath, sha: 'matching-sha' };
+      const getBlob = vi.fn().mockResolvedValue({ content: 'dGVzdA==' });
+      (syncManager as any).client.getBlob = getBlob;
+      (syncManager as any).metadataStore.data.files[manifestPath] = {
+        path: manifestPath,
+        sha: 'matching-sha',
+        dirty: false,
+        justDownloaded: false,
+        lastModified: 1,
+      };
+      (mockVault.adapter.exists as ReturnType<typeof vi.fn>).mockResolvedValue(false);
+      (mockVault.adapter.mkdir as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+      (mockVault.adapter.writeBinary as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+
+      await syncManager.downloadFile(remoteManifest, 2);
+
+      expect(getBlob).toHaveBeenCalledWith({ sha: 'matching-sha', retry: true });
+      expect(mockVault.adapter.writeBinary).toHaveBeenCalledWith(manifestPath, expect.anything());
+      expect(mockVault.adapter.mkdir).toHaveBeenNthCalledWith(1, '.obsidian');
+      expect(mockVault.adapter.mkdir).toHaveBeenNthCalledWith(2, '.obsidian/plugins');
+      expect(mockVault.adapter.mkdir).toHaveBeenNthCalledWith(3, '.obsidian/plugins/lazy-plugins');
+    });
+
+    it('keeps the matching SHA optimization when the local file exists', async () => {
+      const path = 'Books/test.md';
+      const getBlob = vi.fn();
+      (syncManager as any).client.getBlob = getBlob;
+      (syncManager as any).metadataStore.data.files[path] = {
+        path, sha: mockFile.sha, dirty: false, justDownloaded: false, lastModified: 1,
+      };
+      (mockVault.adapter.exists as ReturnType<typeof vi.fn>).mockResolvedValue(true);
+      (mockVault.adapter.stat as ReturnType<typeof vi.fn>).mockResolvedValue({
+        type: 'file', ctime: 0, mtime: 0, size: 4,
+      });
+
+      await syncManager.downloadFile(mockFile, 2);
+
+      expect(getBlob).not.toHaveBeenCalled();
+      expect(mockVault.adapter.writeBinary).not.toHaveBeenCalled();
+    });
+
+    it('does not accept a matching-SHA directory as a downloaded file', async () => {
+      const path = 'Books/test.md';
+      const getBlob = vi.fn();
+      (syncManager as any).client.getBlob = getBlob;
+      (syncManager as any).metadataStore.data.files[path] = {
+        path, sha: mockFile.sha, dirty: false, justDownloaded: false, lastModified: 1,
+      };
+      (mockVault.adapter.exists as ReturnType<typeof vi.fn>).mockResolvedValue(true);
+      (mockVault.adapter.stat as ReturnType<typeof vi.fn>).mockResolvedValue({
+        type: 'folder', ctime: 0, mtime: 0, size: 0,
+      });
+
+      await expect(syncManager.downloadFile(mockFile, 2)).rejects.toThrow('Expected a file at Books/test.md');
+      expect(getBlob).not.toHaveBeenCalled();
+    });
+
+    it('recreates a vanished parent and retries a binary write once on ENOENT', async () => {
+      const file = { ...mockFile, path: 'nested/plugins/example/main.js' };
+      (mockVault.adapter.exists as ReturnType<typeof vi.fn>).mockResolvedValue(false);
+      (mockVault.adapter.mkdir as ReturnType<typeof vi.fn>).mockResolvedValue(undefined);
+      (mockVault.adapter.writeBinary as ReturnType<typeof vi.fn>)
+        .mockRejectedValueOnce(Object.assign(new Error('missing parent'), { code: 'ENOENT' }))
+        .mockResolvedValue(undefined);
+
+      await syncManager.downloadFile(file, 2);
+
+      expect(mockVault.adapter.writeBinary).toHaveBeenCalledTimes(2);
+      expect(mockVault.adapter.mkdir).toHaveBeenCalledTimes(6);
+    });
+
     it('includes folder path in error when mkdir fails', async () => {
       (mockVault.adapter.exists as ReturnType<typeof vi.fn>).mockResolvedValue(false);
       (mockVault.adapter.mkdir as ReturnType<typeof vi.fn>).mockRejectedValue(
@@ -471,6 +607,7 @@ describe('SyncManager - Filename Context in Filesystem Error Messages', () => {
       );
 
       await expect(syncManager.downloadFile(mockFile, Date.now())).rejects.toThrow('Books/test.md');
+      expect(mockVault.adapter.writeBinary).toHaveBeenCalledOnce();
     });
   });
 
@@ -745,6 +882,122 @@ describe('SyncManager - Filename Context in Filesystem Error Messages', () => {
 
       expect(client.getBranchHeadSha).not.toHaveBeenCalled();
       expect(client.createCommit).toHaveBeenCalledWith(expect.objectContaining({ parent: 'snapshot-commit' }));
+    });
+  });
+
+  describe('commitSync conflict destinations', () => {
+    const filePath = '.obsidian/plugins/quickadd/data.json';
+    const manifestPath = '.obsidian/github-sync-metadata.json';
+    const resolution = { filePath, content: '{"kept":true}' };
+
+    function prepareCommit(options: {
+      mkdir?: (path: string) => Promise<void>;
+      write?: (path: string, content: string) => Promise<void>;
+    } = {}) {
+      const operations: string[] = [];
+      const directories = new Set<string>();
+      const adapter = {
+        exists: vi.fn(async (path: string) => directories.has(path)),
+        stat: vi.fn(async (path: string) => directories.has(path)
+          ? { type: 'folder', ctime: 0, mtime: 0, size: 0 }
+          : null),
+        mkdir: vi.fn(async (path: string) => {
+          operations.push(`mkdir:${path}`);
+          if (options.mkdir) return options.mkdir(path);
+          directories.add(path);
+        }),
+        write: vi.fn(async (path: string, content: string) => {
+          operations.push(`write:${path}`);
+          await options.write?.(path, content);
+        }),
+      };
+      const file = { path: filePath, sha: 'data-sha', dirty: false, justDownloaded: false, lastModified: 1 };
+      const metadataStore = {
+        data: { lastSync: 0, files: { [filePath]: file } },
+        save: vi.fn(),
+      };
+      const client = {
+        createTree: vi.fn().mockResolvedValue('tree-sha'),
+        getBranchHeadSha: vi.fn().mockResolvedValue('head-sha'),
+        createCommit: vi.fn().mockResolvedValue('commit-sha'),
+        updateBranchHead: vi.fn(async () => { operations.push('publish'); }),
+      };
+      (syncManager as any).vault.adapter = adapter;
+      (syncManager as any).metadataStore = metadataStore;
+      (syncManager as any).client = client;
+      const treeFiles = {
+        [manifestPath]: { path: manifestPath, mode: '100644', type: 'blob', sha: 'manifest-sha' },
+        [filePath]: { path: filePath, mode: '100644', type: 'blob', sha: 'data-sha' },
+      } as any;
+      return { operations, adapter, client, directories, metadataStore, treeFiles };
+    }
+
+    it('creates conflict parents before publishing and writes the accepted resolution', async () => {
+      const { operations, adapter, client, metadataStore, treeFiles } = prepareCommit();
+
+      await (syncManager as any).commitSync(treeFiles, 'base-tree', metadataStore.data.files, [resolution]);
+
+      const publishIndex = operations.indexOf('publish');
+      expect(operations.indexOf('mkdir:.obsidian')).toBeLessThan(publishIndex);
+      expect(operations.indexOf('mkdir:.obsidian/plugins')).toBeLessThan(publishIndex);
+      expect(operations.indexOf('mkdir:.obsidian/plugins/quickadd')).toBeLessThan(publishIndex);
+      expect(adapter.mkdir).toHaveBeenCalledTimes(3);
+      expect(operations.indexOf(`write:${filePath}`)).toBeGreaterThan(publishIndex);
+      expect(client.updateBranchHead).toHaveBeenCalledOnce();
+      expect(adapter.write).toHaveBeenCalledWith(filePath, resolution.content);
+    });
+
+    it('does not create or write plugin paths for an accepted uninstall', async () => {
+      const { adapter, client, metadataStore, treeFiles } = prepareCommit();
+
+      await (syncManager as any).commitSync(treeFiles, 'base-tree', metadataStore.data.files, [
+        { ...resolution, pluginUninstallChoice: 'accept-uninstall' },
+      ]);
+
+      expect(adapter.mkdir).not.toHaveBeenCalled();
+      expect(adapter.write).not.toHaveBeenCalled();
+      expect(client.updateBranchHead).toHaveBeenCalledOnce();
+    });
+
+    it('fails before branch publication when parent creation fails', async () => {
+      const cause = new Error('permission denied');
+      const { adapter, client, metadataStore, treeFiles } = prepareCommit({
+        mkdir: async () => { throw cause; },
+      });
+
+      await expect((syncManager as any).commitSync(treeFiles, 'base-tree', metadataStore.data.files, [resolution]))
+        .rejects.toMatchObject({ message: expect.stringContaining('.obsidian'), cause });
+      expect(client.updateBranchHead).not.toHaveBeenCalled();
+    });
+
+    it('recreates a vanished parent once after reliable ENOENT and retries the write', async () => {
+      let writes = 0;
+      let prepared: ReturnType<typeof prepareCommit>;
+      prepared = prepareCommit({
+        write: async () => {
+          writes++;
+          if (writes === 1) {
+            prepared.directories.clear();
+            throw Object.assign(new Error('missing parent'), { code: 'ENOENT' });
+          }
+        },
+      });
+
+      await (syncManager as any).commitSync(prepared.treeFiles, 'base-tree', prepared.metadataStore.data.files, [resolution]);
+
+      expect(writes).toBe(2);
+      expect(prepared.adapter.mkdir).toHaveBeenCalledTimes(6);
+    });
+
+    it('reports possible remote publication when the retried local write fails', async () => {
+      const cause = Object.assign(new Error('disk unavailable'), { code: 'ENOENT' });
+      const { client, metadataStore, treeFiles } = prepareCommit({
+        write: async () => { throw cause; },
+      });
+
+      await expect((syncManager as any).commitSync(treeFiles, 'base-tree', metadataStore.data.files, [resolution]))
+        .rejects.toMatchObject({ message: expect.stringMatching(/remote commit may already exist/i), cause });
+      expect(client.updateBranchHead).toHaveBeenCalledOnce();
     });
   });
 

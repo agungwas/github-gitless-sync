@@ -1,4 +1,5 @@
 import { PluginManifest, Vault } from "obsidian";
+import Logger, { serializeError } from "../logger";
 import type { OfficialPackageSource } from "./package-source";
 import type { PluginSyncReport } from "./reconciler";
 import { PluginRuntimeBridge } from "./runtime-bridge";
@@ -11,6 +12,7 @@ export class PluginPackageInstaller {
     private readonly vault: Vault,
     private readonly runtime: PluginRuntimeBridge,
     private readonly stagingRoot: string,
+    private readonly logger: Logger,
   ) {}
 
   async enablePlugin(id: string, report: PluginSyncReport): Promise<void> {
@@ -46,10 +48,10 @@ export class PluginPackageInstaller {
     const adapter = this.vault.adapter;
     const files = PACKAGE_FILES;
     const backups = new Map<string, ArrayBuffer | null>();
-    await adapter.mkdir(this.stagingRoot).catch(() => undefined);
-    await adapter.mkdir(stageDir).catch(() => undefined);
-    await adapter.mkdir(backupDir).catch(() => undefined);
-    await adapter.mkdir(stagedDir).catch(() => undefined);
+    await this.ensureDirectory(this.stagingRoot);
+    await this.ensureDirectory(stageDir);
+    await this.ensureDirectory(backupDir);
+    await this.ensureDirectory(stagedDir);
     const manifestBytes = new TextEncoder().encode(manifestText).buffer;
     const staged = {
       "manifest.json": manifestBytes,
@@ -85,38 +87,84 @@ export class PluginPackageInstaller {
         throw new Error("Installed stylesheet verification failed");
       }
     } catch (error) {
-      let rollbackFailed = false;
+      const rollbackFailures: string[] = [];
       for (const name of files) {
         const target = `${folder}/${name}`;
         const original = backups.get(name) ?? null;
         try {
           if (original) await adapter.writeBinary(target, original);
           else if (await adapter.exists(target)) await adapter.remove(target);
-        } catch {
-          rollbackFailed = true;
+        } catch (rollbackError) {
+          rollbackFailures.push(`${target}: ${String(rollbackError)}`);
+          await this.logger.error("Community plugin install rollback failed", {
+            id,
+            path: target,
+            error: serializeError(rollbackError),
+          });
         }
       }
       if (wasLoaded) {
         try {
           await this.enablePlugin(id, report);
-        } catch {
-          rollbackFailed = true;
+        } catch (rollbackError) {
+          rollbackFailures.push(`${id}: re-enable failed: ${String(rollbackError)}`);
+          await this.logger.error("Community plugin runtime rollback failed", {
+            id,
+            error: serializeError(rollbackError),
+          });
         }
       }
-      if (rollbackFailed) {
-        throw new Error(`Package operation failed and rollback remains pending: ${String(error)}`);
+      await this.removeStageDirectory(id, stageDir);
+      if (rollbackFailures.length) {
+        throw new Error(`Package operation failed and rollback remains pending: ${String(error)}; ${rollbackFailures.join("; ")}`, { cause: error });
       }
-      await adapter.rmdir(stageDir, true).catch(() => undefined);
       throw error;
     }
-    await adapter.rmdir(stageDir, true).catch(() => undefined);
+    await this.removeStageDirectory(id, stageDir);
   }
 
   async cleanupStaging(): Promise<void> {
     try {
+      if (!(await this.vault.adapter.exists(this.stagingRoot))) return;
       await this.vault.adapter.rmdir(this.stagingRoot, true);
-    } catch {
-      // Nothing staged, or staging could not be removed; the next sync tries again.
+    } catch (error) {
+      await this.logger.error("Community plugin staging cleanup failed", {
+        path: this.stagingRoot,
+        error: serializeError(error),
+      });
+    }
+  }
+
+  private async ensureDirectory(path: string): Promise<void> {
+    const adapter = this.vault.adapter;
+    try {
+      if (await adapter.exists(path)) return;
+      await adapter.mkdir(path);
+    } catch (error) {
+      let directoryExists: boolean;
+      try {
+        directoryExists = await adapter.exists(path);
+      } catch (recheckError) {
+        throw new Error(
+          `Failed to prepare package staging directory ${path}: ${String(error)}; existence check failed: ${String(recheckError)}`,
+          { cause: error },
+        );
+      }
+      if (directoryExists) return;
+      throw new Error(`Failed to prepare package staging directory ${path}: ${String(error)}`, { cause: error });
+    }
+  }
+
+  private async removeStageDirectory(id: string, path: string): Promise<void> {
+    try {
+      if (!(await this.vault.adapter.exists(path))) return;
+      await this.vault.adapter.rmdir(path, true);
+    } catch (error) {
+      await this.logger.error("Community plugin staging cleanup failed", {
+        id,
+        path,
+        error: serializeError(error),
+      });
     }
   }
 }

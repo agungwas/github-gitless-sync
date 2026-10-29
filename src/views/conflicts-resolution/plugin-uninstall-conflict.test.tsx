@@ -11,9 +11,9 @@ describe("PluginUninstallConflict", () => {
       onResolve={onResolve}
     />);
 
-    fireEvent.click(screen.getByRole("button", { name: "Keep local plugin and settings" }));
+    fireEvent.click(screen.getByRole("button", { name: "Keep installed" }));
     expect(onResolve).toHaveBeenLastCalledWith("keep-local");
-    fireEvent.click(screen.getByRole("button", { name: "Accept uninstall and remove local changes" }));
+    fireEvent.click(screen.getByRole("button", { name: "Uninstall" }));
     expect(onResolve).toHaveBeenLastCalledWith("accept-uninstall");
     expect(screen.getByText(".obsidian/plugins/quickadd/data.json")).toBeTruthy();
   });

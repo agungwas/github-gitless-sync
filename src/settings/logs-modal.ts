@@ -1,4 +1,4 @@
-import { App, ButtonComponent, Modal, Notice, Setting } from "obsidian";
+import { App, ButtonComponent, Modal, Notice } from "obsidian";
 import { copyToClipboard } from "../utils";
 
 export default class LogsModal extends Modal {
@@ -29,16 +29,18 @@ export default class LogsModal extends Modal {
     logOutput.textContent = "Loading logs...";
     this.contentEl.append(logOutput);
 
-    new Setting(this.contentEl)
-      .addButton((button) => {
-        this.copyButton = button;
-        button.setButtonText("Copy").setDisabled(true).onClick(() => this.copyLogs());
-      })
-      .addButton((button) => {
-        this.cleanButton = button;
-        button.setButtonText("Clean logs").setDisabled(true).onClick(() => this.cleanLogs(logOutput, button));
-      })
-      .addButton((button) => button.setButtonText("Close").onClick(() => this.close()));
+    const actions = document.createElement("div");
+    actions.className = "gitless-logs-actions";
+    this.contentEl.append(actions);
+
+    const cleanButton = new ButtonComponent(actions);
+    this.cleanButton = cleanButton;
+    cleanButton.buttonEl.classList.add("gitless-logs-clean");
+    cleanButton.setButtonText("Clean").setDisabled(true).onClick(() => this.cleanLogs(logOutput, cleanButton));
+
+    this.copyButton = new ButtonComponent(actions);
+    this.copyButton.setButtonText("Copy").setDisabled(true).onClick(() => this.copyLogs());
+    new ButtonComponent(actions).setButtonText("Cancel").onClick(() => this.close());
     void this.loadLogs(logOutput, generation);
   }
 
@@ -97,7 +99,7 @@ export default class LogsModal extends Modal {
     table.className = "gitless-logs-table";
     table.setAttribute("aria-label", "Sync log entries");
     const heading = table.createTHead().insertRow();
-    for (const label of ["Timestamp (local)", "Level", "Message", "Additional data"]) {
+    for (const label of ["Timestamp", "Message", "Level"]) {
       const cell = document.createElement("th");
       cell.scope = "col";
       cell.textContent = label;
@@ -105,12 +107,12 @@ export default class LogsModal extends Modal {
     }
 
     const timestampFormatter = new Intl.DateTimeFormat("en-GB", {
-      year: "numeric", month: "2-digit", day: "2-digit",
+      month: "2-digit", day: "2-digit",
       hour: "2-digit", minute: "2-digit", second: "2-digit",
       hourCycle: "h23",
     });
     const body = table.createTBody();
-    for (const line of lines) {
+    for (const [index, line] of lines.entries()) {
       const row = body.insertRow();
       const entry = this.parseEntry(line);
       const timestamp = row.insertCell();
@@ -119,24 +121,58 @@ export default class LogsModal extends Modal {
         timestamp.textContent = entry.timestamp;
       } else {
         const parts = Object.fromEntries(timestampFormatter.formatToParts(date).map(({ type, value }) => [type, value]));
-        timestamp.textContent = `${parts.day}/${parts.month}/${parts.year} ${parts.hour}:${parts.minute}:${parts.second}`;
+        timestamp.textContent = `${parts.day}/${parts.month} ${parts.hour}:${parts.minute}:${parts.second}`;
       }
       timestamp.title = entry.timestamp;
-      for (const value of [entry.level, entry.message]) {
-        row.insertCell().textContent = value;
-      }
-      const data = row.insertCell();
+      const message = row.insertCell();
       if (entry.additional_data === undefined) {
-        data.textContent = "—";
-        continue;
+        message.textContent = entry.message;
+      } else {
+        row.className = "gitless-log-expandable-row";
+        const toggle = document.createElement("button");
+        toggle.type = "button";
+        toggle.className = "gitless-log-details-toggle";
+        toggle.setAttribute("aria-expanded", "false");
+        const detailsId = `gitless-log-additional-data-${index}`;
+        toggle.setAttribute("aria-controls", detailsId);
+
+        const text = document.createElement("span");
+        text.textContent = entry.message;
+        const indicator = document.createElement("span");
+        indicator.className = "gitless-log-details-indicator";
+        indicator.setAttribute("aria-hidden", "true");
+        indicator.textContent = "▸";
+        toggle.append(text, indicator);
+
+        const details = document.createElement("pre");
+        details.id = detailsId;
+        details.className = "gitless-log-additional-data";
+        details.hidden = true;
+        details.textContent = JSON.stringify(entry.additional_data, null, 2);
+
+        const setExpanded = (expanded: boolean) => {
+          toggle.setAttribute("aria-expanded", String(expanded));
+          toggle.setAttribute("aria-label", `${expanded ? "Hide" : "Show"} additional data for ${entry.message}`);
+          indicator.textContent = expanded ? "▾" : "▸";
+          details.hidden = !expanded;
+        };
+        toggle.setAttribute("aria-label", `Show additional data for ${entry.message}`);
+        toggle.addEventListener("click", () => setExpanded(details.hidden));
+        toggle.addEventListener("keydown", (event) => {
+          if ((event.key !== "Enter" && event.key !== " ") || event.repeat) return;
+          event.preventDefault();
+          setExpanded(details.hidden);
+        });
+        row.addEventListener("click", (event) => {
+          const target = event.target;
+          if (target instanceof Node && (toggle.contains(target) || details.contains(target))) return;
+          if (window.getSelection()?.toString()) return;
+          setExpanded(details.hidden);
+        });
+
+        message.append(toggle, details);
       }
-      const details = document.createElement("details");
-      const summary = document.createElement("summary");
-      summary.textContent = "View data";
-      const content = document.createElement("pre");
-      content.textContent = JSON.stringify(entry.additional_data, null, 2);
-      details.append(summary, content);
-      data.append(details);
+      row.insertCell().textContent = entry.level;
     }
     output.replaceChildren(table);
   }

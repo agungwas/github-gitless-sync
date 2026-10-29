@@ -20,7 +20,7 @@ import MetadataStore, {
 } from "./metadata-store";
 import EventsListener from "./events-listener";
 import { GitHubSyncSettings, getCommitMessageTemplate } from "./settings/settings";
-import Logger, { LOG_FILE_NAME } from "./logger";
+import Logger, { LOG_FILE_NAME, serializeError } from "./logger";
 import { decodeBase64String, hasTextExtension, sanitizePathForLocalFilesystem, pathHasMobileIllegalChars } from "./utils";
 import { classifyPath, PathDecision, PolicyContext } from "./plugin-sync/path-policy";
 import { isExcludedPath } from "./sync-filters";
@@ -28,8 +28,13 @@ import GitHubSyncPlugin from "./main";
 import { BlobReader, Entry, Uint8ArrayWriter, ZipReader } from "@zip.js/zip.js";
 import { PluginManagerRuntime } from "./plugin-sync/runtime-bridge";
 import { PluginSyncCoordinator } from "./plugin-sync/coordinator";
+import { ensureParentDirectory, isPathMissing, withParentDirectoryRetry } from "./fs-paths";
 
 const MS_PER_DAY = 86_400_000;
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
 
 interface SyncAction {
   type: "upload" | "download" | "delete_local" | "delete_remote";
@@ -142,6 +147,9 @@ export default class SyncManager {
         const snapshot = await this.client.getSnapshot({ metadataPath: `${this.vault.configDir}/${MANIFEST_FILE_NAME}` });
         await this.pluginSyncCoordinator.reconciler?.reconcile(snapshot.complete, new Set());
       }
+    } catch (error) {
+      await this.logSyncFailure("Error during first sync", error);
+      throw error;
     } finally {
       this.syncing = false;
     }
@@ -514,13 +522,28 @@ export default class SyncManager {
           : "Sync successful";
       new Notice(successMessage, 5000);
     } catch (err) {
-      await this.logger.error("Error syncing", { error: err instanceof Error ? err.message : String(err) });
+      await this.logSyncFailure("Error syncing", err);
       // Show the error to the user, it's not automatically dismissed to make sure
       // the user sees it.
       new Notice(`Error syncing. ${err}`);
     } finally {
       this.syncing = false;
       notice.hide();
+    }
+  }
+
+  private async logSyncFailure(message: string, error: unknown): Promise<void> {
+    try {
+      await this.logger.error(message, { error: serializeError(error) });
+    } catch (loggingError) {
+      try {
+        console.error("Failed to persist sync error", {
+          error: serializeError(loggingError),
+          originalError: serializeError(error),
+        });
+      } catch {
+        // Logging failure must not hide the original sync failure.
+      }
     }
   }
 
@@ -700,7 +723,10 @@ export default class SyncManager {
         // the file would look changed on every following sync.
         if (preserved !== null) await this.vault.adapter.write(enabledPath, preserved);
       } catch (error) {
-        await this.logger.warn("Could not preserve desktop-only plugin ids", String(error));
+        await this.logger.error("Could not preserve desktop-only plugin ids", {
+          path: enabledPath,
+          error: serializeError(error),
+        });
       }
     }
 
@@ -843,11 +869,12 @@ export default class SyncManager {
         };
         return;
       }
-      await this.downloadFile(
+      const downloadedMetadata = await this.downloadFile(
         files[action.filePath],
         remoteMetadata.files[action.filePath].lastModified,
         remoteMetadata.files[action.filePath],
       );
+      localSnapshot[action.filePath] = { ...downloadedMetadata };
     };
     await Promise.all([
       ...actions
@@ -1316,7 +1343,7 @@ export default class SyncManager {
         (this.metadataStore.data.files[sanitizedKey] && !this.metadataStore.data.files[sanitizedKey].deleted) ||
         (remoteMetadataFiles[sanitizedKey] && !remoteMetadataFiles[sanitizedKey].deleted)
       ) {
-        this.logger.warn("Skipping migration, target exists (collision)", { key, sanitizedKey });
+        await this.logger.warn("Skipping migration, target exists (collision)", { key, sanitizedKey });
         continue;
       }
 
@@ -1333,7 +1360,10 @@ export default class SyncManager {
                 await this.vault.adapter.mkdir(folder);
               }
             } catch (e) {
-              this.logger.warn(`Failed to create folder for migration: ${folder}`, e);
+              await this.logger.error("Failed to create folder for migration", {
+                path: folder,
+                error: serializeError(e),
+              });
             }
           }
 
@@ -1342,7 +1372,11 @@ export default class SyncManager {
             await this.vault.adapter.writeBinary(sanitizedKey, buf);
             await this.vault.adapter.remove(currentDisk);
           } catch (e) {
-            this.logger.warn(`Failed to rename file for migration: ${currentDisk} -> ${sanitizedKey}`, e);
+            await this.logger.error("Failed to rename file for migration", {
+              source: currentDisk,
+              destination: sanitizedKey,
+              error: serializeError(e),
+            });
           }
         } else {
           this.logger.warn("Migration source missing on disk", currentDisk);
@@ -1365,7 +1399,7 @@ export default class SyncManager {
 
     if (migratedOldKeys.size > 0) {
       await this.metadataStore.save();
-      this.logger.info("Migrated illegal filenames", { count: migratedOldKeys.size });
+      await this.logger.info("Migrated illegal filenames", { count: migratedOldKeys.size });
     }
 
     return migratedOldKeys;
@@ -1716,7 +1750,7 @@ export default class SyncManager {
     );
     const syncTime = Date.now();
     this.metadataStore.data.lastSync = syncTime;
-    this.metadataStore.save();
+    await this.metadataStore.save();
 
     this.stampResolvedConflictTimes(localMetadataSnapshot, conflictResolutions, syncTime);
     await this.attachShasToTreeFiles(treeFiles, localMetadataSnapshot, syncTime);
@@ -1725,6 +1759,7 @@ export default class SyncManager {
     this.dropTombstonesFromSnapshot(localMetadataSnapshot, expiredTombstones);
 
     this.writeMetadataIntoTree(treeFiles, localMetadataSnapshot);
+    await this.prepareConflictDestinations(conflictResolutions);
     await this.pushCommit(treeFiles, baseTreeSha, baseCommitSha);
 
     this.mergeCommittedSnapshotIntoLive(localMetadataSnapshot, capturedMetadataSnapshot);
@@ -1733,7 +1768,7 @@ export default class SyncManager {
 
     // Now that the sync is done and we updated the content for conflicting files
     // we can save the latest metadata to disk.
-    this.metadataStore.save();
+    await this.metadataStore.save();
     await this.logger.info("Sync done");
   }
 
@@ -1916,13 +1951,15 @@ export default class SyncManager {
       conflictResolutions
         .filter((resolution) => this.shouldApplyConflictContent(resolution))
         .map(async (resolution) => {
+          const writePath = normalizePath(
+            this.metadataStore.data.files[resolution.filePath]?.localPath
+              ?? sanitizePathForLocalFilesystem(resolution.filePath),
+          );
           try {
-            const writePath = this.metadataStore.data.files[resolution.filePath]?.localPath
-              ?? normalizePath(resolution.filePath);
-            await this.vault.adapter.write(writePath, resolution.content);
+            await this.writeConflictResolution(writePath, resolution);
           } catch (err) {
             throw new Error(
-              `Failed to write conflict resolution for ${resolution.filePath}: ${err instanceof Error ? err.message : String(err)}`,
+              `Remote commit may already exist; failed to write conflict resolution for ${resolution.filePath}: ${errorMessage(err)}`,
               { cause: err },
             );
           }
@@ -1960,8 +1997,11 @@ export default class SyncManager {
       try {
         const manifest = JSON.parse(await this.vault.adapter.read(manifestPath)) as { isDesktopOnly?: boolean };
         if (manifest.isDesktopOnly === true) missing.push(id);
-      } catch {
-        // No readable manifest: the id is not provably desktop-only, leave it out.
+      } catch (error) {
+        await this.logger.error("Could not inspect community plugin manifest", {
+          path: manifestPath,
+          error: serializeError(error),
+        });
       }
     }
     if (missing.length === 0) return null;
@@ -1994,43 +2034,89 @@ export default class SyncManager {
     return resolution.pluginUninstallChoice !== "accept-uninstall";
   }
 
-  async downloadFile(file: GetTreeResponseItem, lastModified: number, remoteMetadata?: FileMetadata) {
+  private async prepareConflictDestinations(conflictResolutions: ConflictResolution[]): Promise<void> {
+    await Promise.all(
+      conflictResolutions
+        .filter((resolution) => this.shouldApplyConflictContent(resolution))
+        .map((resolution) => {
+          const filePath = this.metadataStore.data.files[resolution.filePath]?.localPath
+            ?? sanitizePathForLocalFilesystem(resolution.filePath);
+          return ensureParentDirectory(this.vault.adapter, filePath);
+        }),
+    );
+  }
+
+  private async writeConflictResolution(writePath: string, resolution: ConflictResolution): Promise<void> {
+    await withParentDirectoryRetry(
+      this.vault.adapter,
+      writePath,
+      () => this.vault.adapter.write(writePath, resolution.content),
+    );
+  }
+
+  async downloadFile(
+    file: GetTreeResponseItem,
+    lastModified: number,
+    remoteMetadata?: FileMetadata,
+  ): Promise<FileMetadata> {
     const fileMetadata = this.metadataStore.data.files[file.path];
-    if (fileMetadata && fileMetadata.sha === file.sha) {
-      return;
-    }
-    const blob = await this.client.getBlob({ sha: file.sha, retry: true });
-    const sanitizedPath = normalizePath(sanitizePathForLocalFilesystem(file.path));
-    const fileFolder = normalizePath(sanitizedPath.split("/").slice(0, -1).join("/"));
-    if (!(await this.vault.adapter.exists(fileFolder))) {
-      try {
-        await this.vault.adapter.mkdir(fileFolder);
-      } catch (err) {
-        throw new Error(
-          `Failed to create directory ${fileFolder}: ${err instanceof Error ? err.message : String(err)}`,
-          { cause: err },
-        );
+    if (fileMetadata && fileMetadata.sha === file.sha && fileMetadata.deleted !== true) {
+      const existingPath = normalizePath(
+        fileMetadata.localPath ?? sanitizePathForLocalFilesystem(file.path),
+      );
+      if (!(await isPathMissing(this.vault.adapter, existingPath))) {
+        let existingStat;
+        try {
+          existingStat = await this.vault.adapter.stat(existingPath);
+        } catch (cause) {
+          throw new Error(`Failed to inspect download path ${existingPath}: ${errorMessage(cause)}`, { cause });
+        }
+        if (existingStat?.type === "folder") {
+          throw new Error(`Expected a file at ${existingPath}, but found a directory`);
+        }
+        if (existingStat?.type === "file") {
+          const acceptedMetadata = {
+            ...fileMetadata,
+            path: file.path,
+            sha: file.sha,
+            dirty: false,
+            lastModified: remoteMetadata?.lastModified ?? lastModified,
+          };
+          delete acceptedMetadata.deleted;
+          delete acceptedMetadata.deletedAt;
+          return acceptedMetadata;
+        }
       }
     }
+    const sanitizedPath = normalizePath(sanitizePathForLocalFilesystem(file.path));
+    const localPath = normalizePath(fileMetadata?.localPath ?? sanitizedPath);
+    await ensureParentDirectory(this.vault.adapter, localPath);
+    const blob = await this.client.getBlob({ sha: file.sha, retry: true });
     try {
       const originalBytes = base64ToArrayBuffer(blob.content);
-      await this.vault.adapter.writeBinary(sanitizedPath, originalBytes);
+      await withParentDirectoryRetry(
+        this.vault.adapter,
+        localPath,
+        () => this.vault.adapter.writeBinary(localPath, originalBytes),
+      );
     } catch (err) {
       throw new Error(
-        `Failed to write file ${sanitizedPath}: ${err instanceof Error ? err.message : String(err)}`,
+        `Failed to write file ${localPath}: ${err instanceof Error ? err.message : String(err)}`,
         { cause: err },
       );
     }
-    const localPathDiffers = sanitizedPath !== normalizePath(file.path);
-    this.metadataStore.data.files[file.path] = {
+    const localPathDiffers = localPath !== normalizePath(file.path);
+    const downloadedMetadata: FileMetadata = {
       path: file.path,
       sha: file.sha,
       dirty: false,
       justDownloaded: true,
       lastModified,
-      ...(localPathDiffers ? { localPath: sanitizedPath } : {}),
+      ...(localPathDiffers ? { localPath } : {}),
     };
+    this.metadataStore.data.files[file.path] = downloadedMetadata;
     await this.metadataStore.save();
+    return { ...downloadedMetadata };
   }
 
   async deleteLocalFile(filePath: string, incomingTombstone?: FileMetadata) {
@@ -2113,7 +2199,7 @@ export default class SyncManager {
         justDownloaded: false,
         lastModified: Date.now(),
       };
-      this.metadataStore.save();
+      await this.metadataStore.save();
     } else if (this.settings.syncConfigDir) {
       await this.reconcileConfigDirFiles();
     }
@@ -2153,7 +2239,7 @@ export default class SyncManager {
         lastModified: Date.now(),
       };
     });
-    this.metadataStore.save();
+    await this.metadataStore.save();
   }
 
   /**
@@ -2186,7 +2272,7 @@ export default class SyncManager {
       }
       delete this.metadataStore.data.files[filePath];
     });
-    this.metadataStore.save();
+    await this.metadataStore.save();
   }
 
   /**

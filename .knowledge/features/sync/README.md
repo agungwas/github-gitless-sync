@@ -1,9 +1,9 @@
 ---
-last_updated: "2026-10-15"
-updated_by_plan: "plan-tombstone-retention.md"
+last_updated: "2026-10-29"
+updated_by_plan: "plan-first-install-and-log-modal.md"
 active_skill: ""
 active_since: ""
-decision: "2026-10-15 — Tombstone Retention Setting"
+decision: "DECISIONS.md — 2026-10-29 Repair First-Install Sync and Simplify Log Modal"
 ---
 # Sync Feature
 
@@ -13,9 +13,12 @@ decision: "2026-10-15 — Tombstone Retention Setting"
 | File | Role |
 |---|---|
 | `src/sync-manager.ts` | Core sync logic — `SyncManager` class (1392 lines) |
+| `src/fs-paths.ts` | Missing-path checks, parent-directory creation, and one structured ENOENT retry |
 | `src/metadata-store.ts` | `MetadataStore` + `FileMetadata`/`Metadata` interfaces |
 | `src/events-listener.ts` | `EventsListener` — tracks vault FS events, updates metadata |
 | `src/github/client.ts` | `GithubClient` — all GitHub REST API calls |
+| `src/logger.ts` | Opt-in sync logging with nested error-cause serialization |
+| `src/settings/logs-modal.ts` | Log viewer with expandable additional data |
 | `src/settings/settings.ts` | `GitHubSyncSettings` interface + `DEFAULT_SETTINGS` (incl. `tombstoneRetentionDays`, default 30) |
 | `src/main.ts` | `GitHubSyncPlugin` — plugin entrypoint, wires everything together |
 
@@ -155,6 +158,18 @@ Config dir files filtered out if `syncConfigDir=false` (except manifest).
 - This is stored locally and will NOT be synced across devices.
 - Any `{TOKEN}` → `moment().format(TOKEN)` via Obsidian's bundled moment.js
 - Invalid moment token → kept as `{TOKEN}` literally (signals misconfiguration, doesn't crash)
+
+### First-install filesystem recovery
+
+`isPathMissing(adapter, path)` uses `DataAdapter.exists()` to check absence. `ensureParentDirectory(adapter, filePath)` creates missing ancestor folders, and `withParentDirectoryRetry()` retries once only when the write exposes a structured `ENOENT`. A matching remote SHA skips download only when the local destination exists as a file; a missing file is fetched and its parent is created. Existing directories at file destinations fail clearly.
+
+Successful downloads return accepted `FileMetadata` to the frozen local snapshot. This keeps committed metadata aligned with downloaded files without copying unrelated live metadata or retaining stale tombstones. Conflict destinations are prepared before publishing the remote branch; if a later local write fails, the error states that remote publication may already have succeeded.
+
+### Logging and log viewer
+
+When logging is enabled, filesystem and plugin-lifecycle error paths record path context and nested causes. When disabled, automatic logger initialization and writes do not create the log file or append entries. Explicit log-viewer read and clean actions remain available.
+
+The log modal shows a compact timestamp column, message column, and level column to the message's right. Rows with additional data expand it beneath the message on click, Enter, or Space; details stay hidden by default.
 
 ## GitHub API Calls (via `GithubClient`)
 

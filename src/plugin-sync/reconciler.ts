@@ -1,6 +1,6 @@
 import { Platform, PluginManifest, Vault, requireApiVersion } from "obsidian";
 import MetadataStore from "../metadata-store";
-import Logger from "../logger";
+import Logger, { formatError, serializeError } from "../logger";
 import { OfficialPackageSource } from "./package-source";
 import { NativePluginMutation, PluginRuntimeBridge } from "./runtime-bridge";
 import { PluginPackageInstaller } from "./installer";
@@ -52,7 +52,7 @@ export class PluginLifecycleReconciler {
     this.pluginRoot = `${this.configDir}/plugins`;
     this.stagingRoot = `${this.configDir}/.gitless-plugin-staging`;
     this.reporter = new PluginSyncReporter(logger);
-    this.installer = new PluginPackageInstaller(vault, runtime, this.stagingRoot);
+    this.installer = new PluginPackageInstaller(vault, runtime, this.stagingRoot, logger);
   }
 
   startObservingNativeMutations(): () => void {
@@ -61,7 +61,7 @@ export class PluginLifecycleReconciler {
         await this.logger.error("Native community plugin change could not be recorded", {
           id: event.id,
           kind: event.kind,
-          error: String(error),
+          error: serializeError(error),
         });
       });
     });
@@ -100,17 +100,40 @@ export class PluginLifecycleReconciler {
 
   async observeLocalRemovals(): Promise<void> {
     const report = EMPTY_REPORT();
-    const listing = await this.vault.adapter.list(this.pluginRoot).catch(() => null);
-    if (!listing) return;
+    let listing: Awaited<ReturnType<typeof this.vault.adapter.list>>;
+    try {
+      listing = await this.vault.adapter.list(this.pluginRoot);
+    } catch (error) {
+      await this.logger.error("Community plugin removal scan could not list plugin directory", {
+        path: this.pluginRoot,
+        error: serializeError(error),
+      });
+      return;
+    }
     const currentIds = new Set(listing.folders.map((folder) => folder.slice(this.pluginRoot.length + 1)).filter(validId));
-    const enabledText = await this.vault.adapter.read(`${this.configDir}/community-plugins.json`).catch(() => null);
-    if (enabledText === null) return;
+    const enabledPath = `${this.configDir}/community-plugins.json`;
+    let enabledText: string;
+    try {
+      enabledText = await this.vault.adapter.read(enabledPath);
+    } catch (error) {
+      await this.logger.error("Community plugin removal scan could not read enabled plugin list", {
+        path: enabledPath,
+        error: serializeError(error),
+      });
+      return;
+    }
     let enabled: Set<string>;
     try {
       const value: unknown = JSON.parse(enabledText);
-      if (!Array.isArray(value) || value.some((id) => typeof id !== "string")) return;
+      if (!Array.isArray(value) || value.some((id) => typeof id !== "string")) {
+        throw new Error("invalid enabled-plugin list");
+      }
       enabled = new Set(value);
-    } catch {
+    } catch (error) {
+      await this.logger.error("Community plugin removal scan could not parse enabled plugin list", {
+        path: enabledPath,
+        error: serializeError(error),
+      });
       return;
     }
     for (const id of currentIds) {
@@ -137,7 +160,7 @@ export class PluginLifecycleReconciler {
         this.absenceScans.delete(id);
         report.uninstalled.push(id);
       } catch (error) {
-        report.skipped.push(`${id}: uninstall evidence unavailable: ${String(error)}`);
+        report.failed.push(`${id}: uninstall evidence unavailable at ${this.pluginRoot}/${id}/manifest.json: ${formatError(error)}`);
       }
     }
     if (report.uninstalled.length) await this.metadataStore.save();
@@ -154,17 +177,20 @@ export class PluginLifecycleReconciler {
     }
     let enabledIds: Set<string>;
     try {
-      const enabled = JSON.parse(await this.vault.adapter.read(`${this.configDir}/community-plugins.json`));
+      const enabledPath = `${this.configDir}/community-plugins.json`;
+      const enabled = JSON.parse(await this.vault.adapter.read(enabledPath));
       if (!Array.isArray(enabled) || enabled.some((id) => typeof id !== "string")) throw new Error("invalid enabled-plugin list");
       enabledIds = new Set(enabled);
     } catch (error) {
-      report.skipped.push(`enabled state unavailable: ${String(error)}`);
+      report.failed.push(`${this.configDir}/community-plugins.json: enabled state unavailable: ${formatError(error)}`);
       await this.reporter.log("reconciliation", report);
       return report;
     }
-    const folders = await this.vault.adapter.list(this.pluginRoot).catch(() => null);
-    if (!folders) {
-      report.skipped.push("plugin directory unavailable");
+    let folders: Awaited<ReturnType<typeof this.vault.adapter.list>>;
+    try {
+      folders = await this.vault.adapter.list(this.pluginRoot);
+    } catch (error) {
+      report.failed.push(`${this.pluginRoot}: plugin directory unavailable: ${formatError(error)}`);
       await this.reporter.log("reconciliation", report);
       return report;
     }
@@ -184,7 +210,7 @@ export class PluginLifecycleReconciler {
           }
           report.disabled.push(id);
         } catch (error) {
-          const message = `${id}: disable failed: ${String(error)}`;
+          const message = `${id}: disable failed: ${formatError(error)}`;
           report.failed.push(message);
         }
       }
@@ -212,7 +238,7 @@ export class PluginLifecycleReconciler {
         });
         if (!completed) report.skipped.push(`${id}: native package changed during reconciliation`);
       } catch (error) {
-        report.failed.push(`${id}: uninstall failed: ${String(error)}`);
+        report.failed.push(`${id}: uninstall failed at ${folder}: ${formatError(error)}`);
       }
     }
 
@@ -262,7 +288,7 @@ export class PluginLifecycleReconciler {
             packageFiles = await this.resolvePackage(manifest);
           } catch (error) {
             this.pendingHydrate.add(id);
-            const reason = String(error);
+            const reason = formatError(error);
             if (reason.includes("not in the official registry")) report.skipped.push(`${id}: ${reason}`);
             else report.failed.push(`${id}: ${reason}`);
             continue;
@@ -296,8 +322,7 @@ export class PluginLifecycleReconciler {
         if (error instanceof PluginMutationChangedError) {
           report.skipped.push(`${id}: native package changed during reconciliation`);
         } else {
-          report.failed.push(`${id}: ${String(error)}`);
-          await this.logger.error("Community plugin reconciliation failed", { id, error: String(error) });
+          report.failed.push(`${id}: failed at ${manifestPath}: ${formatError(error)}`);
         }
       }
     }

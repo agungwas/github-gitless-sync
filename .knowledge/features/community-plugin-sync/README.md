@@ -1,7 +1,7 @@
 ---
-last_updated: "2026-10-15"
-updated_by_plan: "plan-native-community-plugin-sync.md (Update 2026-10-15)"
-decision: "DECISIONS.md — 2026-10-15 Metadata-Neutral Community Plugin Sync"
+last_updated: "2026-10-29"
+updated_by_plan: "plan-first-install-and-log-modal.md"
+decision: "DECISIONS.md — 2026-10-29 Repair First-Install Sync and Simplify Log Modal"
 active_skill: ""
 active_since: ""
 ---
@@ -71,3 +71,15 @@ Only manual, interval, startup, focus and blur syncs. Native install/uninstall/e
 - Hand-edited official `main.js` is not detected; download integrity relies on HTTPS from GitHub.
 - On a first sync an existing local plugin of another version is not re-hydrated (empty hydrate set); only missing `main.js` triggers it.
 - Unverified: whether Obsidian mobile drops desktop-only ids from `community-plugins.json` (a 2022 report says yes, staff say it should not); the upload-time restore covers both cases.
+
+### Update 2026-10-29 — first-install recovery
+
+- Before each regular sync, `SyncManager.reconcileConfigDirFiles()` records new syncable config files and clears a local tombstone only when the file's mtime is later than `deletedAt`.
+- When a remote live manifest and a local manifest tombstone both exist, `determineSyncActions()` compares remote `lastModified` with local `deletedAt`: the newer timestamp selects download or remote deletion. A managed remote deletion is allowed when the local plugin manifest is tombstoned. Equal timestamps produce no deletion action in that branch.
+- `isPathMissing()` checks absence through `DataAdapter.exists()`; `ensureParentDirectory()` creates missing ancestors. `downloadFile()` skips matching-SHA downloads only when the destination is an existing file. Missing files are fetched; destination directories fail clearly.
+- Successful downloads return accepted metadata to the frozen `localSnapshot`, preventing stale tombstones from being recommitted while keeping unrelated concurrent metadata out of the commit.
+- Conflict-resolution parents are prepared before branch publication. A structured `ENOENT` write race gets one parent-creation retry; later local-write failures identify that a remote commit may already exist.
+- Remote uninstall unloads the plugin and recursively removes its folder. `reconcile()` hydrates compatible plugins from their local manifest and reports registry, download, and runtime failures through `PluginSyncReporter`.
+- Filesystem and lifecycle failure logs include path context and nested causes when logging is enabled. With logging disabled, automatic logger writes create no file and append no entries.
+- The 15-second removal scan only considers IDs previously observed locally; it requires two absent scans, absence from the enabled list, no loaded plugin or active mutation, and an acknowledged manifest SHA before recording an uninstall.
+- `src/plugin-sync/uninstall-sync.test.ts` now models missing plugin directories and rejects writes without parents; it checks committed metadata and a subsequent sync. It remains an in-memory single-device fixture, not a physical Mac/Android test.

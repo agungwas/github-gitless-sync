@@ -538,7 +538,7 @@ export default class GitHubSyncSettingsTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName("Enable logging")
       .setDesc(
-        "If enabled logs from this plugin will be saved in a file in your config directory.",
+        "If enabled, logs from this plugin are saved in a file in your config directory.",
       )
       .addToggle((toggle) => {
         toggle

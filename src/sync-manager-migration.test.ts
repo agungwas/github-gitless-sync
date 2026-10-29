@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import SyncManager from './sync-manager';
 import { Vault } from 'obsidian';
 import { GitHubSyncSettings } from './settings/settings';
-import Logger from './logger';
+import Logger, { serializeError } from './logger';
 
 if (!(Array.prototype as any).contains) {
   (Array.prototype as any).contains = Array.prototype.includes;
@@ -164,6 +164,34 @@ describe('SyncManager - Sanitize Remote Convergence Migration', () => {
     expect(migrated.has('Books >/note.md')).toBe(true);
     expect(mockVault.adapter.mkdir).toHaveBeenCalledWith('Books ＞');
     expect((syncManager as any).metadataStore.data.files['Books ＞/note.md']).toBeDefined();
+  });
+
+  it("logs folder creation failures with path and filesystem code", async () => {
+    (syncManager as any).metadataStore.data.files['Books >/note.md'] = { path: 'Books >/note.md', sha: 'abc' };
+    (mockVault.adapter.exists as ReturnType<typeof vi.fn>).mockImplementation(async (path: string) => path === 'Books >/note.md');
+    const cause = Object.assign(new Error('Permission denied'), { code: 'EACCES', path: 'Books ＞' });
+    (mockVault.adapter.mkdir as ReturnType<typeof vi.fn>).mockRejectedValue(cause);
+    (mockVault.adapter.readBinary as ReturnType<typeof vi.fn>).mockResolvedValue(new ArrayBuffer(4));
+
+    await (syncManager as any).migrateIllegalFilenames({}, {});
+
+    expect(mockLogger.error).toHaveBeenCalledWith('Failed to create folder for migration', {
+      path: 'Books ＞', error: serializeError(cause),
+    });
+  });
+
+  it("logs file migration failures with source, destination, and cause", async () => {
+    (syncManager as any).metadataStore.data.files['x >.md'] = { path: 'x >.md', sha: 'abc' };
+    (mockVault.adapter.exists as ReturnType<typeof vi.fn>).mockResolvedValue(true);
+    (mockVault.adapter.readBinary as ReturnType<typeof vi.fn>).mockResolvedValue(new ArrayBuffer(4));
+    const cause = Object.assign(new Error('Read-only filesystem'), { code: 'EROFS' });
+    (mockVault.adapter.writeBinary as ReturnType<typeof vi.fn>).mockRejectedValue(cause);
+
+    await (syncManager as any).migrateIllegalFilenames({}, {});
+
+    expect(mockLogger.error).toHaveBeenCalledWith('Failed to rename file for migration', {
+      source: 'x >.md', destination: 'x ＞.md', error: serializeError(cause),
+    });
   });
 
   it('T6: internal file skipped', async () => {

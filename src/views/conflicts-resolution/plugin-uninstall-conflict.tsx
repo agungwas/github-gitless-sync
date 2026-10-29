@@ -16,8 +16,8 @@ export default function PluginUninstallConflict({
       <h2>Plugin removal conflict: {pluginId}</h2>
       <p>Another device removed this plugin, while this device has local changes in:</p>
       <ul>{localPaths.map((path) => <li key={path}>{path}</li>)}</ul>
-      <button onClick={() => onResolve("keep-local")}>Keep local plugin and settings</button>
-      <button onClick={() => onResolve("accept-uninstall")}>Accept uninstall and remove local changes</button>
+      <button onClick={() => onResolve("keep-local")}>Keep installed</button>
+      <button onClick={() => onResolve("accept-uninstall")}>Uninstall</button>
     </section>
   );
 }

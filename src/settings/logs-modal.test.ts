@@ -44,6 +44,14 @@ describe("LogsModal", () => {
     vi.restoreAllMocks();
   });
 
+  it("groups Clean on the left and Copy and Cancel on the right", () => {
+    openModal(async () => "");
+    const actions = document.querySelector(".gitless-logs-actions") as HTMLElement;
+    const buttons = within(actions).getAllByRole("button");
+    expect(buttons.map((button) => button.textContent)).toEqual(["Clean", "Copy", "Cancel"]);
+    expect(buttons[0].classList.contains("gitless-logs-clean")).toBe(true);
+  });
+
   it("shows JSON entries as safe table cells and copies the original text on request", async () => {
     let resolveLogs!: (logs: string) => void;
     const readLogs = vi.fn(() => new Promise<string>((resolve) => { resolveLogs = resolve; }));
@@ -58,11 +66,12 @@ describe("LogsModal", () => {
     resolveLogs(logs);
     const table = await screen.findByRole("table", { name: "Sync log entries" });
     expect(within(table).getAllByRole("columnheader").map((cell) => cell.textContent))
-      .toEqual(["Timestamp (local)", "Level", "Message", "Additional data"]);
+      .toEqual(["Timestamp", "Message", "Level"]);
     const cells = within(table).getAllByRole("cell");
     expect(cells[0].textContent).not.toBe("2026-10-15T03:00:00.000Z");
     expect(cells[0].title).toBe("2026-10-15T03:00:00.000Z");
-    expect(cells.slice(1).map((cell) => cell.textContent)).toEqual(["INFO", message, "—"]);
+    expect(cells.slice(1).map((cell) => cell.textContent)).toEqual([message, "INFO"]);
+    expect(within(table).queryByRole("button", { name: /additional data/i })).toBeNull();
     expect(output.querySelector("img")).toBeNull();
     expect(copyToClipboard).not.toHaveBeenCalled();
     expect(copyButton.disabled).toBe(false);
@@ -73,9 +82,9 @@ describe("LogsModal", () => {
   });
 
   it.each([
-    { timeZone: "Asia/Jakarta", timestamp: "2026-10-15T03:00:00Z", expected: "15/10/2026 10:00:00" },
-    { timeZone: "America/New_York", timestamp: "2026-10-15T03:00:00Z", expected: "14/10/2026 23:00:00" },
-    { timeZone: "Asia/Jakarta", timestamp: "2026-10-15T17:00:00Z", expected: "16/10/2026 00:00:00" },
+    { timeZone: "Asia/Jakarta", timestamp: "2026-10-15T03:00:37Z", expected: "15/10 10:00:37" },
+    { timeZone: "America/New_York", timestamp: "2026-10-15T03:00:37Z", expected: "14/10 23:00:37" },
+    { timeZone: "Asia/Jakarta", timestamp: "2026-10-15T17:00:37Z", expected: "16/10 00:00:37" },
   ])("uses device timezone $timeZone and exact format at $timestamp", async ({ timeZone, timestamp, expected }) => {
     const DateTimeFormat = Intl.DateTimeFormat;
     vi.spyOn(Intl, "DateTimeFormat").mockImplementation(function (_locales, options) {
@@ -114,7 +123,7 @@ describe("LogsModal", () => {
     expect(within(table).getAllByRole("cell", { name: "Retrying" })).toHaveLength(2);
     invalid.forEach((line, index) => {
       expect(within(rows[index + 1]).getAllByRole("cell").map((cell) => cell.textContent))
-        .toEqual(["—", "UNPARSED", line, "—"]);
+          .toEqual(["—", line, "UNPARSED"]);
     });
   });
 
@@ -125,14 +134,42 @@ describe("LogsModal", () => {
       openModal(async () => logs);
 
       const table = await screen.findByRole("table");
-      const summary = within(table).getByText("View data");
-      expect(table.querySelector("details")?.open).toBe(false);
-      fireEvent.click(summary);
-      expect(table.querySelector("details")?.open).toBe(true);
-      expect(table.querySelector("pre")?.textContent).toBe(JSON.stringify(data, null, 2));
+      const button = within(table).getByRole<HTMLButtonElement>("button", { name: /additional data/i });
+      const details = table.querySelector("pre");
+      expect(within(table).getAllByRole("cell")).toHaveLength(3);
+      expect(details?.hidden).toBe(true);
+      expect(button.getAttribute("aria-expanded")).toBe("false");
+      fireEvent.click(within(table).getAllByRole("cell")[0]);
+      expect(details?.hidden).toBe(false);
+      expect(button.getAttribute("aria-expanded")).toBe("true");
+      expect(details?.textContent).toBe(JSON.stringify(data, null, 2));
+      fireEvent.keyDown(button, { key: " " });
+      expect(details?.hidden).toBe(true);
+      fireEvent.keyDown(button, { key: "Enter" });
+      expect(details?.hidden).toBe(false);
+      fireEvent.click(button);
+      expect(details?.hidden).toBe(true);
+      expect(button.getAttribute("aria-expanded")).toBe("false");
       expect(table.querySelector("img")).toBeNull();
     },
   );
+
+  it("keeps each additional-data disclosure independent", async () => {
+    const logs = [
+      { timestamp: "2026-10-15T03:00:00Z", level: "WARN", message: "First", additional_data: { id: 1 } },
+      { timestamp: "2026-10-15T03:00:01Z", level: "ERROR", message: "Second", additional_data: { id: 2 } },
+    ].map((entry) => JSON.stringify(entry)).join("\n");
+    openModal(async () => logs);
+
+    const table = await screen.findByRole("table");
+    const buttons = within(table).getAllByRole<HTMLButtonElement>("button", { name: /additional data/i });
+    const details = Array.from(table.querySelectorAll("pre"));
+
+    fireEvent.click(buttons[0]);
+    expect(details.map((item) => item.hidden)).toEqual([false, true]);
+    fireEvent.click(buttons[1]);
+    expect(details.map((item) => item.hidden)).toEqual([false, false]);
+  });
 
   it("shows read failures inside the modal", async () => {
     openModal(async () => { throw new Error("Disk unavailable"); });
@@ -158,7 +195,7 @@ describe("LogsModal", () => {
     openModal(() => read);
     const output = screen.getByRole("region");
 
-    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     resolveLogs("INFO Delayed read");
     await read;
 
@@ -173,7 +210,7 @@ describe("LogsModal", () => {
     openModal(async () => logs, clean);
     await screen.findByRole("table");
 
-    fireEvent.click(screen.getByRole("button", { name: "Clean logs" }));
+    fireEvent.click(screen.getByRole("button", { name: "Clean" }));
 
     await waitFor(() => expect(screen.getByRole("region").textContent).toContain("No logs recorded yet"));
     expect(clean).toHaveBeenCalledTimes(1);
@@ -188,12 +225,12 @@ describe("LogsModal", () => {
     openModal(async () => "Original logs", clean);
     await screen.findByRole("table");
 
-    fireEvent.click(screen.getByRole("button", { name: "Clean logs" }));
+    fireEvent.click(screen.getByRole("button", { name: "Clean" }));
 
     await waitFor(() => expect(Notice).toHaveBeenCalledWith("Failed cleaning logs: Error: Disk unavailable", 10000));
     expect(screen.getByRole("cell", { name: "Original logs" })).toBeTruthy();
     expect(screen.getByRole<HTMLButtonElement>("button", { name: "Copy" }).disabled).toBe(false);
-    expect(screen.getByRole<HTMLButtonElement>("button", { name: "Clean logs" }).disabled).toBe(false);
+    expect(screen.getByRole<HTMLButtonElement>("button", { name: "Clean" }).disabled).toBe(false);
   });
 
   it("blocks duplicate cleaning and ignores completion after closing and reopening", async () => {
@@ -202,7 +239,7 @@ describe("LogsModal", () => {
     const clean = vi.fn(() => pending);
     const modal = openModal(async () => "Visible logs", clean);
     await screen.findByRole("table");
-    const button = screen.getByRole<HTMLButtonElement>("button", { name: "Clean logs" });
+    const button = screen.getByRole<HTMLButtonElement>("button", { name: "Clean" });
 
     button.click();
     button.click();

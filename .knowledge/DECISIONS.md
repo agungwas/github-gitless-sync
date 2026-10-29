@@ -3,6 +3,10 @@ updated: "2026-10-15"
 ---
 # Decisions
 
+## 2026-10-29 — Repair First-Install Sync and Simplify Log Modal
+**Chose:** dedicated path-absence and parent-directory helpers, missing-file-aware download, targeted snapshot correction, and expandable log rows for `community-plugin-sync`. **Over:** only adding a mkdir catch, or restructuring the entire sync transaction. **Why:** the logs show an absent conflict destination while code also permits SHA-only download skipping and stale snapshot state; a narrow repair addresses these paths without claiming rollback or changing metadata schema. The modal keeps timestamp, message, and level as three columns, with data disclosed beneath the message. Reproduce the suspected failure paths before implementation.
+**Plan:** ./features/community-plugin-sync/plans/plan-first-install-and-log-modal.md
+
 ## 2026-10-15 — Tombstone Retention Setting
 **Chose:** setting `tombstoneRetentionDays` (default 30); `commitSync()` drops rows that are `deleted`, older than retention, and absent from this vault, for `sync`. **Over:** keeping tombstones forever; anti-resurrection guard (delete_local when local row has sha, remote row gone, content unchanged).
 **Why:** stop unbounded metadata growth; human accepted that a device offline longer than retention may resurrect deleted files.

@@ -9,7 +9,8 @@ import {
 import { GitHubSyncSettings, DEFAULT_SETTINGS } from "./settings/settings";
 import GitHubSyncSettingsTab from "./settings/tab";
 import SyncManager, { ConflictFile, ConflictResolution } from "./sync-manager";
-import Logger from "./logger";
+import Logger, { serializeError } from "./logger";
+import { MANIFEST_FILE_NAME } from "./metadata-store";
 import {
   ConflictsResolutionView,
   CONFLICTS_RESOLUTION_VIEW_TYPE,
@@ -99,7 +100,7 @@ export default class GitHubSyncPlugin extends Plugin {
     delete (this.settings as GitHubSyncSettings & { credentialKey?: string }).credentialKey;
 
     this.logger = new Logger(this.app.vault, this.settings.enableLogging);
-    this.logger.init();
+    await this.logger.init();
 
     this.registerView(
       CONFLICTS_RESOLUTION_VIEW_TYPE,
@@ -121,7 +122,16 @@ export default class GitHubSyncPlugin extends Plugin {
         disablePlugin?: (id: string) => Promise<void>;
       } }).plugins,
     );
-    await this.syncManager.loadMetadata();
+    try {
+      await this.syncManager.loadMetadata();
+    } catch (error) {
+      await this.logger.error("Failed to load sync metadata", {
+        configDir: this.app.vault.configDir,
+        metadataFile: `${this.app.vault.configDir}/${MANIFEST_FILE_NAME}`,
+        error: serializeError(error),
+      });
+      throw error;
+    }
 
     if (this.settings.syncStrategy == "interval") {
       this.restartSyncInterval();
