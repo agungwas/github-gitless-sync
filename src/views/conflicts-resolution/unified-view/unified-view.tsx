@@ -15,6 +15,7 @@ const UnifiedView = ({
   onFileResolved,
   onConfirm,
   onReset,
+  onClose,
 }: {
   // Conflicts that still need to be resolved
   initialFiles: ConflictFile[];
@@ -24,6 +25,7 @@ const UnifiedView = ({
   onFileResolved: (resolution: ConflictResolution) => void;
   onConfirm: () => void;
   onReset: () => void;
+  onClose: () => void;
 }) => {
   const [files, setFiles] = React.useState(initialFiles);
 
@@ -82,7 +84,7 @@ const UnifiedView = ({
     return (
       <React.StrictMode>
         {totalCount === 0 ? (
-          <NoConflictsScreen />
+          <NoConflictsScreen onClose={onClose} />
         ) : (
           // We solved all conflicts, once confirmed we can resume syncing
           <ConflictsResolvedScreen

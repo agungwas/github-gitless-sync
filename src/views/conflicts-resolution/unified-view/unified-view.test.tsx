@@ -2,6 +2,7 @@ import React from "react";
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import UnifiedView from "./unified-view";
+import SplitView from "../split-view/split-view";
 
 const files = () => [
   { filePath: "a.md", remoteContent: "remote a", localContent: "local a" },
@@ -16,6 +17,7 @@ const renderView = (overrides: Record<string, unknown> = {}) => {
     onFileResolved: vi.fn(),
     onConfirm: vi.fn(),
     onReset: vi.fn(),
+    onClose: vi.fn(),
     ...overrides,
   };
   render(<UnifiedView {...(props as any)} />);
@@ -82,5 +84,26 @@ describe("UnifiedView", () => {
     // One file was already resolved before the view was opened
     expect(screen.getByText("Reset all conflicts")).toBeDefined();
     expect(props.onFileResolved).not.toHaveBeenCalled();
+  });
+});
+
+describe.each([["unified", UnifiedView], ["split", SplitView]] as const)("%s empty view", (_mode, View) => {
+  it("forwards Close without confirming conflicts", () => {
+    const onClose = vi.fn();
+    const onConfirm = vi.fn();
+    render(
+      <View
+        initialFiles={[]}
+        totalCount={0}
+        autoCloseDelay={3}
+        onFileResolved={vi.fn()}
+        onConfirm={onConfirm}
+        onReset={vi.fn()}
+        onClose={onClose}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(onConfirm).not.toHaveBeenCalled();
   });
 });

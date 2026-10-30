@@ -7,7 +7,6 @@ import {
   Notice,
 } from "obsidian";
 import GitHubSyncPlugin from "src/main";
-import LogsModal from "./logs-modal";
 import {
   DEFAULT_SETTINGS,
   getCommitMessageTemplate,
@@ -558,9 +557,7 @@ export default class GitHubSyncSettingsTab extends PluginSettingTab {
       .setName("View logs")
       .setDesc("Read the log file in a dialog and copy it when reporting bugs.")
       .addButton((button) => {
-        button.setButtonText("View logs").onClick(() => {
-          new LogsModal(this.app, () => this.plugin.logger.read(), () => this.plugin.logger.clean()).open();
-        });
+        button.setButtonText("View logs").onClick(() => this.plugin.openLogs());
       });
 
     new Setting(containerEl)

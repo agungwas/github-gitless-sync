@@ -45,6 +45,14 @@ describe("ConflictsResolutionView", () => {
     });
   });
 
+  it("closes the empty view without finalizing conflicts", () => {
+    view.closeConflictView();
+    expect(leaf.detach).not.toHaveBeenCalled();
+    vi.runAllTimers();
+    expect(leaf.detach).toHaveBeenCalledTimes(1);
+    expect(plugin.finalizeConflicts).not.toHaveBeenCalled();
+  });
+
   describe("onClose", () => {
     it("confirms if everything was resolved but not yet confirmed", async () => {
       plugin.allConflictsResolved.mockReturnValue(true);

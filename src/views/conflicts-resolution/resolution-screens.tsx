@@ -26,10 +26,11 @@ const subtitleStyle: React.CSSProperties = {
 
 /// Shown when the conflicts view has nothing to resolve, for example when it
 /// gets opened manually while there are no conflicts.
-export const NoConflictsScreen = () => (
+export const NoConflictsScreen = ({ onClose }: { onClose: () => void }) => (
   <div style={screenStyle}>
     <div style={titleStyle}>No conflicts to resolve</div>
     <div style={subtitleStyle}>That's good, keep going</div>
+    <button type="button" onClick={onClose}>Close</button>
   </div>
 );
 

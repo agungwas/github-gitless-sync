@@ -27,7 +27,7 @@ describe.each([
     const onFileResolved = vi.fn();
     const onConfirm = vi.fn();
     render(<View initialFiles={files} totalCount={1} autoCloseDelay={3}
-      onFileResolved={onFileResolved} onConfirm={onConfirm} onReset={vi.fn()} />);
+      onFileResolved={onFileResolved} onConfirm={onConfirm} onReset={vi.fn()} onClose={vi.fn()} />);
 
     fireEvent.click(screen.getByRole("button", { name: label }));
 

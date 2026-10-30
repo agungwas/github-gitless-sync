@@ -109,10 +109,12 @@ describe("ConflictsResolvedScreen", () => {
 });
 
 describe("NoConflictsScreen", () => {
-  it("shows the message without any action", () => {
-    render(<NoConflictsScreen />);
+  it("closes the view when Close is clicked", () => {
+    const onClose = vi.fn();
+    render(<NoConflictsScreen onClose={onClose} />);
     expect(screen.getByText("No conflicts to resolve")).toBeDefined();
-    expect(screen.queryByRole("button")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    expect(onClose).toHaveBeenCalledTimes(1);
   });
 });
 

@@ -8,6 +8,7 @@ import {
 } from "obsidian";
 import { GitHubSyncSettings, DEFAULT_SETTINGS } from "./settings/settings";
 import GitHubSyncSettingsTab from "./settings/tab";
+import LogsModal from "./settings/logs-modal";
 import SyncManager, { ConflictFile, ConflictResolution } from "./sync-manager";
 import Logger, { serializeError } from "./logger";
 import { MANIFEST_FILE_NAME } from "./metadata-store";
@@ -175,6 +176,13 @@ export default class GitHubSyncPlugin extends Plugin {
       callback: this.openConflictsView.bind(this),
     });
 
+    this.addCommand({
+      id: "view-logs",
+      name: "View logs",
+      repeatable: false,
+      callback: this.openLogs.bind(this),
+    });
+
     this.registerDomEvent(window, "focus", () => {
       if (this.settings.syncOnWindowFocus) {
         this.sync();
@@ -194,6 +202,14 @@ export default class GitHubSyncPlugin extends Plugin {
         this.sync();
       }
     });
+  }
+
+  openLogs(): void {
+    new LogsModal(
+      this.app,
+      () => this.logger.read(),
+      () => this.logger.clean(),
+    ).open();
   }
 
   async sync() {

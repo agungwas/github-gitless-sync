@@ -41,12 +41,16 @@ export class ConflictsResolutionView extends ItemView {
     }
     // Closing is deferred so we don't unmount React while it's still
     // running one of its own event handlers.
-    setTimeout(() => this.leaf.detach(), 0);
+    this.closeConflictView();
   }
 
   private onReset() {
     this.plugin.resetConflicts();
     this.setConflictFiles(this.plugin.getConflicts());
+  }
+
+  private closeConflictView() {
+    setTimeout(() => this.leaf.detach(), 0);
   }
 
   setConflictFiles(conflicts: ConflictFile[]) {
@@ -97,6 +101,7 @@ export class ConflictsResolutionView extends ItemView {
       onFileResolved: this.onFileResolved.bind(this),
       onConfirm: this.onConfirm.bind(this),
       onReset: this.onReset.bind(this),
+      onClose: this.closeConflictView.bind(this),
     };
 
     if (diffMode === "split") {
